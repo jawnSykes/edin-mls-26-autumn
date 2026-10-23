@@ -35,7 +35,7 @@ __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_l
   // Set idx to this thread's global index. Threads without a pair
   // (q_pairs + k_pairs in total) do nothing.
   idx = (blockDim.x * blockIdx.x) + threadIdx.x;
-  if (idx >= (blockDim.x * blockIdx.x) - (q_pairs + k_pairs)) {
+  if (idx >= (q_pairs + k_pairs)) {
     return;
   }
   // ============================================================
