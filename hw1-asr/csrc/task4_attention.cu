@@ -107,18 +107,43 @@ __global__ void attention_kernel(const float* q, const float* k, const float* v,
     // ======================== BLANK 4.3 =========================
     // Set s to this query's score for key j0 + lane, if the query may see that
     // key (last_key).
-    // YOUR CODE HERE
+    if (j0 + lane <= last_key) {
+      float dot = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        dot += qv[d] * k_tile[lane * k_pitch + d];
+      }
+      s = dot;
+    }
     // ============================================================
 
     float p = 0.0f;  // this lane's exp(s - m_new): unnormalised probability of key j0 + lane
     // ======================== BLANK 4.4 =========================
     // Update m, l and acc with this tile (guide, section 3) and set p.
-    // YOUR CODE HERE
+    float tile_max = warp_reduce_max(s);
+    float m_new = fmaxf(m, tile_max);
+    if (m_new != -INFINITY) {
+      float corr = expf(m - m_new);
+      p = expf(s - m_new);
+      l = l * corr + warp_reduce_sum(p);
+      for (int i=0;i<dims;++i) {
+        acc[i] *= corr;
+      }
+      m = m_new;
+    }
+   
+
+
     // ============================================================
 
     // ======================== BLANK 4.5 =========================
     // Add this tile's values, weighted by p, to acc.
-    // YOUR CODE HERE
+    for (int x=0;x<KV_TILE;++x) {
+      float p_x = __shfl_sync(FULL_MASK, p, x);
+      for (int i=0;i<dims;++i) {
+        int d = i * WARP_SIZE + lane;
+        acc[i] += p_x * v_tile[x * head_dim + d];
+      }
+    }
     // ============================================================
 
     __syncthreads();  // all warps are done with this tile before the next one overwrites it
@@ -126,7 +151,13 @@ __global__ void attention_kernel(const float* q, const float* k, const float* v,
 
   // ======================== BLANK 4.6 =========================
   // Write acc / l to out for this warp's query.
-  // YOUR CODE HERE
+  if (active) {
+    float* out_row = out + (static_cast<size_t>(b) * seq_q + qi) * q_stride + h * head_dim;
+    for (int i =0; i< dims; ++i) {
+      int d = i * WARP_SIZE + lane;
+      out_row[d] = acc[i] / l;
+    }
+  }
   // ============================================================
 }
 
