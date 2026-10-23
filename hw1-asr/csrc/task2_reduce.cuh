@@ -86,7 +86,9 @@ __device__ __forceinline__ MaxSum maxsum_merge(MaxSum a, MaxSum b) {
   // ======================== BLANK 2.4 =========================
   // Merge a and b with the rule in the guide. Merging two empty summaries
   // ({-INFINITY, 0}) must give an empty summary, not NaN.
-  // YOUR CODE HERE
+  r.m = fmaxf(a.m,b.m);
+  if (r.m == -INFINITY) return r; // Guard against NaN
+`  r.l = a.l * expf(a.m - r.m) + b.l * expf(b.m - r.m);
   // ============================================================
   return r;
 }
