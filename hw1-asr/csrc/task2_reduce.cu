@@ -42,7 +42,14 @@ __global__ void rmsnorm_kernel(const float* x, const float* weight, float* y, in
 
   // ======================== BLANK 2.5 =========================
   // RMSNorm of this row: y = x / sqrt(mean(x^2) + eps) * weight.
-  // YOUR CODE HERE
+  // 1. inverse of root mean of squares
+  float sum_squares = 0.0f;
+  for (int c = threadIdx.x ; c < cols; c += blockDim.x) sum_squares += xr[c] * xr[c];
+  const float inv_rms = rsqrtf((block_reduce_sum(sum_squares) / cols) + eps);
+
+  // 2. Write
+  for (int c = threadIdx.x; c < cols; c += blockDim.x)
+    yr[c] = xr[c] * inv_rms * weight[c];
   // ============================================================
 }
 
