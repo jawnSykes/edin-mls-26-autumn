@@ -45,7 +45,11 @@ __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_l
   // ======================== BLANK 1.2 =========================
   // Threads past q's pairs work on k: make x, num_heads and idx describe the
   // tensor this thread works on, with idx counting from 0 inside it.
-  // YOUR CODE HERE
+  if (idx >= q_pairs) {
+    x = k;
+    num_heads = num_k_heads;
+    idx = idx - q_pairs;
+  }
   // ============================================================
 
   int row = 0;  // which row (one head of one token) of x
