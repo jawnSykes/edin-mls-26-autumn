@@ -53,7 +53,7 @@ __global__ void attention_kernel(const float* q, const float* k, const float* v,
   // ======================== BLANK 4.1 =========================
   // Set kv_h, the K/V head that query head h reads (GQA: groups of consecutive
   // query heads share one K/V head).
-  // YOUR CODE HERE
+  kv_h = h / (num_heads / num_kv_heads);
   // ============================================================
 
   const size_t q_stride = static_cast<size_t>(num_heads) * head_dim;      // token to token in q, out
@@ -89,7 +89,18 @@ __global__ void attention_kernel(const float* q, const float* k, const float* v,
     // Copy keys and values j0 .. j0+KV_TILE-1 of this head into k_tile (rows of
     // k_pitch floats) and v_tile (rows of head_dim floats), with 0 for keys past
     // seq_k. All threads of the block take part.
-    // YOUR CODE HERE
+    for (int i = threadIdx.x; i < KV_TILE * head_dim; i += blockDim.x) {
+      int row = i / head_dim;
+      int col = i % head_dim;
+      if (j0 + row >= seq_k) {
+        k_tile[row * k_pitch + col] = 0.0f;
+        v_tile[row * head_dim + col] = 0.0f;
+      } else {
+        k_tile[row * k_pitch + col] = k_head[(j0 + row) * kv_stride + col];
+        v_tile[row * head_dim + col] = v_head[(j0 + row) * kv_stride + col];
+      }
+    }
+    __syncthreads();
     // ============================================================
 
     float s = -INFINITY;  // this lane's score for key j0 + lane
