@@ -88,7 +88,7 @@ __device__ __forceinline__ MaxSum maxsum_merge(MaxSum a, MaxSum b) {
   // ({-INFINITY, 0}) must give an empty summary, not NaN.
   r.m = fmaxf(a.m,b.m);
   if (r.m == -INFINITY) return r; // Guard against NaN
-`  r.l = a.l * expf(a.m - r.m) + b.l * expf(b.m - r.m);
+  r.l = a.l * expf(a.m - r.m) + b.l * expf(b.m - r.m);
   // ============================================================
   return r;
 }
