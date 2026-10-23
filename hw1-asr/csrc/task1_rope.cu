@@ -57,7 +57,9 @@ __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_l
   int pos = 0;  // position of the token this row belongs to
   // ======================== BLANK 1.3 =========================
   // Set row, i (the pair inside the row) and pos (the token position of the row).
-  // YOUR CODE HERE
+  row = idx / half;
+  i = idx % half;
+  pos = (row / num_heads) % seq_len;
   // ============================================================
 
   float* v = x + static_cast<size_t>(row) * head_dim;  // start of this row
