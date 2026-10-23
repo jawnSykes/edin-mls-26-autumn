@@ -65,7 +65,11 @@ __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_l
   float* v = x + static_cast<size_t>(row) * head_dim;  // start of this row
   // ======================== BLANK 1.4 =========================
   // Rotate the pair (v[i], v[i + half]) in place.
-  // YOUR CODE HERE
+  float angle = pos * inv_freq[i];
+  float a = v[i];
+  float b = v[i+half];
+  v[i] = a * cosf(angle) - b * sinf(angle);
+  v[i+half] = b * cosf(angle) + a * sinf(angle);
   // ============================================================
 }
 
