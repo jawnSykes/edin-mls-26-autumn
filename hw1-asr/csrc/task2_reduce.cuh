@@ -60,7 +60,12 @@ __device__ __forceinline__ float block_reduce_max(float v) {
 
   // ======================== BLANK 2.3 =========================
   // Block-wide maximum, built like block_reduce_sum above.
-  // YOUR CODE HERE
+  v = warp_reduce_max(v);
+  if (lane == 0) partial[warp] = v;
+  __syncthreads();
+  v = (lane < num_warps) ? partial[lane] : -INFINITY;
+  v = warp_reduce_max(v);
+  __syncthreads();
   // ============================================================
   return v;
 }
