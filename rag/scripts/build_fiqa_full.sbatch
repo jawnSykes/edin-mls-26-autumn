@@ -42,9 +42,9 @@ python -c 'import torch; assert torch.cuda.is_available(), "no CUDA"; print("tor
 command -v quota >/dev/null && quota -s || true
 
 # Node-local scratch: /disk/$USER/fiqa-full/<job id>; created here, removed when the job exits.
-SCRATCH="/disk/$USER/fiqa-full/${SLURM_JOB_ID}"
+SCRATCH="/disk/scratch/$USER/fiqa-full/${SLURM_JOB_ID}"
 mkdir -p "$SCRATCH"
-trap 'rm -rf "$SCRATCH"; rmdir "/disk/$USER/fiqa-full" 2>/dev/null || true' EXIT
+trap 'rm -rf "$SCRATCH"; rmdir "/disk/scratch/$USER/fiqa-full" 2>/dev/null || true' EXIT
 export TMPDIR="$SCRATCH/tmp"
 mkdir -p "$TMPDIR"
 echo "Node-local scratch: $SCRATCH"
