@@ -374,7 +374,14 @@ def cmd_prepare(args):
     print(f"  {len(course)} records, " + ", ".join(f"{k}: {len(v)} queries" for k, v in course_qrels.items()))
 
     print("Loading FiQA from the HF cache ...")
-    fiqa_corpus, fiqa_queries, fiqa_qrels = load_fiqa()
+    try:
+        fiqa_corpus, fiqa_queries, fiqa_qrels = load_fiqa()
+    except Exception as e:
+        if type(e).__name__ != "LocalEntryNotFoundError":
+            raise
+        sys.exit("Could not download BeIR/fiqa from the Hugging Face Hub and it is not cached in "
+                 f"{os.environ.get('HF_HUB_CACHE') or os.environ.get('HF_HOME') or '~/.cache/huggingface'}.\n"
+                 "Check that this node has internet access and HF_HUB_OFFLINE is not set.")
     print(f"  {len(fiqa_corpus)} docs, {len(fiqa_queries)} queries")
 
     print("Matching course records ...")
