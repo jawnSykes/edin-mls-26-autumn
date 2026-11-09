@@ -6,9 +6,9 @@ import json
 import os
 
 
-def name_index(path: str | Path, M: int, efConstruction: int, efSearch: int) -> str:
+def name_index(path: str | Path, M: int, efConstruction: int) -> str:
     stem = Path(path).stem
-    return f"hnsw-{stem}-{M}-{efConstruction}-{efSearch}.faiss"
+    return f"hnsw-{stem}-{M}-{efConstruction}.faiss"
 
 
 class HNSWRetriever:
