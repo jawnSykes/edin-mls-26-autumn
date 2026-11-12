@@ -3,6 +3,10 @@ from scipy.sparse import csr_matrix
 
 import heapq
 
+def random_order(n: int, seed: int) -> np.ndarray:
+    """Uniform random permutation: the negative-control layout (no locality at all)."""
+    return np.random.default_rng(seed).permutation(n).astype(np.int64)
+
 def goorder(adj_list: csr_matrix, w: int) -> np.ndarray:
     """GO-PQ (Wei et al. 2016, Alg. 2)"""
     def inc(node):
@@ -73,3 +77,30 @@ def _prep_adj_list(adj_list: csr_matrix):
     out = [a.indices[a.indptr[i]:a.indptr[i + 1]].tolist() for i in range(n_rows)]
     inn = [t.indices[t.indptr[i]:t.indptr[i + 1]].tolist() for i in range(n_rows)]
     return out, inn
+
+def inverse(perm: np.ndarray) -> np.ndarray:
+    # old_id -> new_pos
+    inv = np.empty_like(perm)
+    inv[perm] = np.arange(len(perm), dtype=perm.dtype)
+    return inv
+
+
+def apply_order(index, perm: np.ndarray) -> np.ndarray:
+    # Apply with permutation with FAISS API
+    perm = np.ascontiguousarray(perm, dtype=np.int64)
+    if not np.array_equal(np.sort(perm), np.arange(index.ntotal)):
+        raise ValueError("perm is not a permutation of 0..ntotal-1")
+    index.permute_entries(perm)
+    return perm
+
+
+def to_original_ids(I: np.ndarray, perm: np.ndarray) -> np.ndarray:
+    # Map ids from reordered index to original
+    return np.where(I >= 0, perm[np.maximum(I, 0)], -1)
+
+
+def apply_order_arrays(perm: np.ndarray, adj: csr_matrix, vecs: np.ndarray, entry: int):
+    # Numpy based reordering for sense check
+    adj_new = adj[perm][:, perm].tocsr()
+    vecs_new = vecs[perm]
+    return adj_new, vecs_new, int(inverse(perm)[entry])
