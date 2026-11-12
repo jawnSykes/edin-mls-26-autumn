@@ -104,3 +104,28 @@ def apply_order_arrays(perm: np.ndarray, adj: csr_matrix, vecs: np.ndarray, entr
     adj_new = adj[perm][:, perm].tocsr()
     vecs_new = vecs[perm]
     return adj_new, vecs_new, int(inverse(perm)[entry])
+
+
+def level0_csr(index) -> csr_matrix:
+    # Bottom-layer graph of a FAISS IndexHNSW as CSR (row i = out-links of node i)
+    import faiss
+    h = index.hnsw
+    n = index.ntotal
+    offsets = faiss.vector_to_array(h.offsets).astype(np.int64)[:-1]
+    neighbors = faiss.vector_to_array(h.neighbors)
+    cum = faiss.vector_to_array(h.cum_nneighbor_per_level)
+    width = int(cum[1] - cum[0])  # 2*M slots on level 0, padded with -1
+    nbrs = neighbors[offsets[:, None] + cum[0] + np.arange(width)]
+    rows = np.repeat(np.arange(n), width)
+    cols = nbrs.ravel()
+    keep = cols >= 0
+    return csr_matrix((np.ones(keep.sum(), dtype=np.int8), (rows[keep], cols[keep])), shape=(n, n))
+
+
+def bfs_order(adj: csr_matrix, start: int) -> np.ndarray:
+    # Breadth-first walk from `start`, so a node's neighbours get nearby ids.
+    # Nodes the walk can't reach are appended in their original order.
+    from scipy.sparse.csgraph import breadth_first_order
+    seen = breadth_first_order(adj, start, directed=True, return_predecessors=False)
+    rest = np.setdiff1d(np.arange(adj.shape[0]), seen, assume_unique=True)
+    return np.concatenate([seen, rest]).astype(np.int64)
