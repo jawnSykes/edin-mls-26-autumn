@@ -10,10 +10,12 @@
 #   sbatch --export=ALL,STEPS="4-reorder 5-cachesweep diag report" rag/extensions/scripts/run_experiments.sbatch
 # Environment check only:  STEPS=env bash rag/extensions/scripts/run_experiments.sbatch
 #
-# Laptop (wall-clock steps), after copying $PERSIST_INDEX_PATH and settings.json from the
-# cluster so both machines time the same saved graphs:
-#   STEPS="3-stage1 4-reorder 10-queryset" rag/extensions/scripts/with_pinned_freq.sh \
+# Laptop (wall-clock steps plus real hardware counters), after copying $PERSIST_INDEX_PATH and
+# settings.json from the cluster so both machines time the same saved graphs:
+#   STEPS="3-stage1 4-reorder perf 10-queryset report" rag/extensions/scripts/with_pinned_freq.sh \
 #       bash rag/extensions/scripts/run_experiments.sbatch
+# The perf step reads hardware counters with `perf stat` (cycles, instructions, LLC and dTLB
+# misses), which the cluster blocks (perf_event_paranoid=4); it is not in the default STEPS.
 #
 # Where things go (set below, same on the cluster and the laptop):
 #   RESULTS_DIR         rag/results/ann/ in this checkout (gitignored): rows, env, logs, report
@@ -61,6 +63,10 @@ fi
 [[ -n "${VIRTUAL_ENV:-}" ]] || source "${RAG_VENV:-$HOME/mls-rag-env}/bin/activate"
 export PYTHONUNBUFFERED=1 PERSIST_INDEX_PATH
 export FAISS_SIMD_LEVEL="${FAISS_SIMD_LEVEL:-AVX2}"   # one code path everywhere (see the brief)
+# Same for numpy's OpenBLAS: it picks its kernels from the CPU (AVX-512 on Sapphire Rapids nodes),
+# but under valgrind it sees no AVX-512 and falls back to Haswell (AVX2). Pin Haswell so the numpy
+# exact baseline runs the same AVX2 code in the timed steps and in the Cachegrind sweep.
+export OPENBLAS_CORETYPE="${OPENBLAS_CORETYPE:-Haswell}"
 PY="$(command -v python)"
 BENCH="$PY rag/extensions/scripts/bench.py"
 EXP="$PY rag/extensions/scripts/exp.py"
@@ -86,6 +92,9 @@ LLS="${LLS:-1 2 4 8 16 32 64 128}"          # MiB
 ROUNDS="${ROUNDS:-3}"; ROUNDS_REORDER="${ROUNDS_REORDER:-5}"; REPS="${REPS:-5}"
 TUNE_REPS="${TUNE_REPS:-1}"; GW_NQ="${GW_NQ:-500}"; SMOKE_NQ="${SMOKE_NQ:-20}"; NQ="${NQ:-}"
 JOBS="${JOBS:-${SLURM_CPUS_PER_TASK:-4}}"
+# The two exact baselines HNSW is compared with: the course's ExactDenseRetriever itself (the
+# current method) and the same search in FAISS (IndexFlatIP), which separates library from algorithm.
+EXACT="exact_dense faiss_exact"
 
 TS="$(date +%Y%m%dT%H%M%S)"
 WORK="$SCRATCH_DIR/$TS-$$"
@@ -128,9 +137,12 @@ EOF
         "$VALGRIND" --tool=cachegrind --cache-sim=yes --D1="$D1" --LL=4194304,16,64 --cachegrind-out-file=/dev/null \
             "$PY" -c 'import numpy as np, faiss
 i = faiss.IndexHNSWFlat(16, 8); i.add(np.random.rand(500, 16).astype("float32"))
-i.search(np.random.rand(5, 16).astype("float32"), 5)' > "$WORK/preflight.log" 2>&1 || true
-        grep -q "LLd misses" "$WORK/preflight.log" || { tail -20 "$WORK/preflight.log" >&2; fail "cachegrind could not run FAISS"; }
-        echo "  $("$VALGRIND" --version) ($VALGRIND), D1=$D1: cachegrind runs FAISS ok"
+i.search(np.random.rand(5, 16).astype("float32"), 5)
+X = np.random.rand(2000, 384).astype("float32"); (X[:1] @ X.T).argmax()
+print("preflight ok")' > "$WORK/preflight.log" 2>&1 || true
+        grep -q "^preflight ok" "$WORK/preflight.log" && grep -q "LLd misses" "$WORK/preflight.log" \
+            || { tail -20 "$WORK/preflight.log" >&2; fail "cachegrind could not run FAISS and numpy"; }
+        echo "  $("$VALGRIND" --version) ($VALGRIND), D1=$D1: cachegrind runs FAISS and numpy ok"
     fi
 
     if has_step 11-pipeline; then
@@ -146,6 +158,16 @@ i.search(np.random.rand(5, 16).astype("float32"), 5)' > "$WORK/preflight.log" 2>
         else
             echo "  no GPU visible: skipping 11-pipeline (submit with --gres=gpu:1 to include it)"; STEPS="${STEPS/11-pipeline/}"
         fi
+    fi
+    if [[ " $STEPS " == *" perf "* ]]; then  # only when asked for: the cluster blocks perf
+        PERF="${PERF:-$(command -v perf || true)}"
+        [[ -n "$PERF" ]] || fail "perf not found (install linux-tools, or set PERF=/path/to/perf)"
+        local paranoid; paranoid="$(cat /proc/sys/kernel/perf_event_paranoid)"
+        (( paranoid <= 2 )) || fail "perf_event_paranoid=$paranoid: user-space counters blocked (needs <= 2)"
+        "$PERF" stat -x, -e cycles:u,instructions:u "$PY" -c 'sum(range(10**6))' 2>&1 | grep -q "cycles" \
+            || fail "perf stat could not count cycles"
+        export PERF
+        echo "  perf ($PERF), perf_event_paranoid=$paranoid: counters ok"
     fi
     if [[ -z "${SLURM_JOB_ID:-}" && -z "${BENCH_CPU:-}" ]]; then
         echo "  !! not under Slurm and not via with_pinned_freq.sh: laptop clock not pinned"
@@ -174,7 +196,7 @@ write_env() {
         echo "git status:"; git status --short 2>/dev/null | sed 's/^/  /'
         "$PY" -c 'import sys, faiss, numpy, scipy; print("python", sys.executable, "| faiss", faiss.__version__, faiss.SIMDConfig.get_level_name(), "| numpy", numpy.__version__, "| scipy", scipy.__version__)'
         echo "RESULTS_DIR=$RESULTS_DIR PERSIST_INDEX_PATH=$PERSIST_INDEX_PATH SCRATCH_DIR=$SCRATCH_DIR"
-        echo "FAISS_SIMD_LEVEL=$FAISS_SIMD_LEVEL BENCH_CPU=${BENCH_CPU:-} JOBS=$JOBS"
+        echo "FAISS_SIMD_LEVEL=$FAISS_SIMD_LEVEL OPENBLAS_CORETYPE=$OPENBLAS_CORETYPE BENCH_CPU=${BENCH_CPU:-} JOBS=$JOBS"
         [[ -n "${VALGRIND:-}" ]] && echo "valgrind: $VALGRIND ($("$VALGRIND" --version)) D1=$D1"
         echo "CORPORA=$CORPORA"; echo "COURSE_QV=$COURSE_QV FIQA_QV=$FIQA_QV QRELS=$QRELS"
         echo "MS=$MS EFCS=$EFCS EFS=$EFS LLS=$LLS GORDER_WS=$GORDER_WS"
@@ -210,7 +232,7 @@ step_2_tune() {
 }
 
 stage1() {
-    bench "$1" "$2" rows.csv --queries "$QCOURSE" --index numpy flat hnsw --M "$(setting "$1" M)" \
+    bench "$1" "$2" rows.csv --queries "$QCOURSE" --index $EXACT hnsw --M "$(setting "$1" M)" \
         --efc "$(setting "$1" efc)" --ef $EFS --rounds "$ROUNDS" --reps "$REPS"
 }
 step_3_stage1() { each_corpus stage1; }
@@ -226,7 +248,7 @@ reorder() {
 step_4_reorder() { each_corpus reorder; }
 
 sweep_one() {  # sweep_one <name> <emb> <LL MiB>: own CSV, so parallel sweeps never share a file
-    bench "$1" "$2" "rows-$1-LL$3.csv" --mode cachegrind --queries "$QCOURSE" --index flat hnsw \
+    bench "$1" "$2" "rows-$1-LL$3.csv" --mode cachegrind --queries "$QCOURSE" --index $EXACT hnsw \
         --M "$(setting "$1" M)" --efc "$(setting "$1" efc)" --ef "$(setting "$1" ef95)" "$(setting "$1" ef99)" \
         --order $(orders "$1" "$RANDOM_SEEDS_CG") --LL $(($3 << 20))
 }
@@ -254,13 +276,22 @@ step_5_cachesweep() {
     (( bad == 0 )) || fail "some cache-sweep runs failed (see above)"
 }
 
+# Real hardware counters (laptop): the same cells as step 4 plus both exact baselines, under
+# perf stat, warm cache, net of a load + warm-up twin. Counters vary run to run, so several rounds.
+perfstat() {
+    bench "$1" "$2" rows.csv --mode perf --queries "$QCOURSE" --index $EXACT hnsw --M "$(setting "$1" M)" \
+        --efc "$(setting "$1" efc)" --ef "$(setting "$1" ef95)" "$(setting "$1" ef99)" \
+        --order $(orders "$1" "$RANDOM_SEEDS_TIME") --rounds "$ROUNDS" --reps "$REPS"
+}
+step_perf() { each_corpus perfstat; }
+
 step_9_quality() {
     $EXP quality --cache "$PERSIST_INDEX_PATH" --corpus $CORPORA --queries "$QCOURSE" --qrels "$QRELS" \
         --settings "$SETTINGS" --out "$OUT"
 }
 
 queryset() {
-    bench "$1" "$2" rows.csv --queries "$QFIQA" --index numpy flat hnsw --M "$(setting "$1" M)" --efc "$(setting "$1" efc)" \
+    bench "$1" "$2" rows.csv --queries "$QFIQA" --index $EXACT hnsw --M "$(setting "$1" M)" --efc "$(setting "$1" efc)" \
         --ef "$(setting "$1" ef95)" "$(setting "$1" ef99)" --order identity bfs "gorder:$(setting "$1" gorder_w)" \
         --rounds "$ROUNDS" --reps "$TUNE_REPS"
 }
@@ -273,7 +304,9 @@ step_11_pipeline() {
     if [[ "${ASR_CUDA:-all}" != none ]]; then
         make -s -C "${RAG_ASR_ROOT:-hw1-asr}" lib
     fi
-    $EXP pipeline --cache "$PERSIST_INDEX_PATH" --settings "$SETTINGS" --device "${DEVICE:-cpu}" --n "${PIPE_N:-20}" --out "$OUT"; }
+    # Every dev query (PIPE_N limits it), exact_dense vs HNSW at the tuned 0.95-recall setting.
+    $EXP pipeline --cache "$PERSIST_INDEX_PATH" --settings "$SETTINGS" --device "${DEVICE:-cpu}" --qrels "$QRELS" \
+        ${PIPE_N:+--n "$PIPE_N"} --out "$OUT"; }
 
 step_diag() {
     local names="" spec; for spec in $CORPORA; do names="$names ${spec%%=*}"; done

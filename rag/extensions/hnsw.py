@@ -39,6 +39,8 @@ class HNSWRetriever:
 
         d = embeddings.shape[1]
 
+        # Seconds spent on graph construction (index.add); None when a saved graph was loaded
+        self.build_s = None
         self.loaded = self.index_path.exists()
         if self.loaded:
             # There is already an index at this config -- reuse that exact graph
@@ -48,7 +50,9 @@ class HNSWRetriever:
         else:
             self.index = faiss.IndexHNSWFlat(d, M, faiss.METRIC_INNER_PRODUCT)
             self.index.hnsw.efConstruction = efConstruction
+            t = time.perf_counter()
             self.index.add(embeddings)
+            self.build_s = time.perf_counter() - t
             self.persist_index()
 
         self.set_ef_search(efSearch)

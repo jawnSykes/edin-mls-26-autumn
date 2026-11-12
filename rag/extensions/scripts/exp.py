@@ -81,7 +81,7 @@ def fnum(x):
 
 
 def med(rows, col):
-    return statistics.median(fnum(r[col]) for r in rows)
+    return statistics.median(fnum(r.get(col, "")) for r in rows)  # missing column (older rows): nan
 
 
 def group(rows, *cols):
@@ -291,6 +291,7 @@ def cmd_quality(a):
 
 def cmd_pipeline(a):
     import os
+    import time
     from src.asr_adapter import ASRAdapter
     from src.context_builder import SimpleContextBuilder
     from src.data import CourseData
@@ -300,31 +301,81 @@ def cmd_pipeline(a):
     from src.retriever import ExactDenseRetriever
     from extensions.hnsw import HNSWRetriever
 
+    from src.metrics import recall_at_k, mrr_at_k, ndcg_at_k
+
+    class Timed:
+        """Wraps a retriever to also time the whole retrieve() call. The pipeline's retrieval_ms
+        is the retriever's own figure (the search alone); call_ms adds its input checks and
+        id lookup, i.e. what the pipeline actually waits for."""
+        def __init__(self, r):
+            self.r = r
+
+        def retrieve(self, q, k=5):
+            t = time.perf_counter()
+            res = self.r.retrieve(q, k=k)
+            res["call_ms"] = (time.perf_counter() - t) * 1000.0
+            return res
+
+    # HNSW at the tuned setting that is fastest while reaching 0.95 recall@10 against exact
+    # search (step 2): the most favourable case for HNSW's latency, so if even this saves
+    # nothing visible end to end, no slower HNSW setting will.
     s = load_settings(a.settings)[a.name]
     data_dir = Path(a.data_dir)
     emb, ids = data_dir / "embeddings" / "corpus_enc_a.npy", data_dir / "embeddings" / "corpus_enc_a_ids.json"
     os.environ["PERSIST_INDEX_PATH"] = str(Path(a.cache) / a.name)
-    retrievers = {"exact": ExactDenseRetriever(emb, ids),
-                  "hnsw": HNSWRetriever(emb, ids, M=s["M"], efConstruction=s["efc"], efSearch=s["ef95"])}
+    retrievers = {"exact_dense": Timed(ExactDenseRetriever(emb, ids)),
+                  "hnsw": Timed(HNSWRetriever(emb, ids, M=s["M"], efConstruction=s["efc"], efSearch=s["ef95"]))}
+    qrels = load_qrels(a.qrels or data_dir / "qrels_dev.tsv")
     data = CourseData(data_dir)
     asr = ASRAdapter()
     asr.prepare()
     pipe = RAGPipeline(asr=asr, encoder=LocalEncoder(ROOT / "models" / "enc_a", device=a.device),
                        retriever=None, data=data, context_builder=SimpleContextBuilder(), generator=ELMGenerator())
-    items = data.audio_items("dev")[:a.n + 1]
-    rows = []
+    items = data.audio_items("dev")
+    if a.n:
+        items = items[:a.n]
+    print(f"[pipeline] {len(items)} dev queries; hnsw M={s['M']} efc={s['efc']} ef={s['ef95']}; k={a.k}")
+    for r in retrievers.values():  # warm-up, discarded: model loading, first CUDA call
+        pipe.retriever = r
+        pipe.answer_audio(data_dir / items[0]["audio_file"], k=a.k)
+
+    rows, compare, answers = [], [], []
     for i, item in enumerate(items):
-        for rname, r in retrievers.items():
+        # Alternate which retriever goes first, so per-query warm-up (e.g. the encoder's first
+        # call on new input) doesn't land on the same one every time.
+        order = list(retrievers.items())
+        got = {}
+        for rname, r in (order if i % 2 == 0 else order[::-1]):
             pipe.retriever = r
-            res = pipe.answer_audio(data_dir / item["audio_file"], k=a.k)
-            if i == 0:
-                continue  # warm-up: model loading, first CUDA call
+            res = got[rname] = pipe.answer_audio(data_dir / item["audio_file"], k=a.k)
             t = res["timing"]
+            ranked, rel = res["retrieval"]["record_ids"], qrels.get(item["query_id"], {})
             rows.append(dict(query_id=item["query_id"], retriever=rname, **t,
-                             retrieval_share=t["retrieval_ms"] / t["end_to_end_ms"]))
+                             retrieval_call_ms=res["retrieval"]["call_ms"],
+                             retrieval_share=res["retrieval"]["call_ms"] / t["end_to_end_ms"],
+                             has_qrels=bool(rel),
+                             **{f"recall@{a.k}": recall_at_k(ranked, list(rel), a.k) if rel else "",
+                                f"mrr@{a.k}": mrr_at_k(ranked, list(rel), a.k) if rel else "",
+                                f"ndcg@{a.k}": ndcg_at_k(ranked, rel, a.k) if rel else ""}))
+            answers.append(dict(query_id=item["query_id"], retriever=rname, transcript=res["transcript"],
+                                record_ids=ranked, answer=res["answer"]))
             print(f"[pipeline] {item['query_id']} {rname}: " + " ".join(f"{k_}={v:.1f}" for k_, v in t.items()))
+        # What the user would see change: the context passed to the LLM, and the answer.
+        # The two runs transcribe the audio separately, so check the transcripts match too.
+        e, h = got["exact_dense"], got["hnsw"]
+        e_ids, h_ids = e["retrieval"]["record_ids"], h["retrieval"]["record_ids"]
+        compare.append(dict(query_id=item["query_id"], same_transcript=e["transcript"] == h["transcript"],
+                            topk_overlap=len(set(e_ids) & set(h_ids)) / a.k, same_context=e_ids == h_ids,
+                            same_answer=e["answer"].strip() == h["answer"].strip()))
     asr.close()
-    write_rows(Path(a.out) / "rows.csv", rows)
+    out = Path(a.out)
+    write_rows(out / "rows.csv", rows)
+    write_rows(out / "rows-compare.csv", compare)
+    (out / "answers.jsonl").write_text("".join(json.dumps(r) + "\n" for r in answers))
+    print(f"[pipeline] same context {np.mean([c['same_context'] for c in compare]):.3f}, "
+          f"top-{a.k} overlap {np.mean([c['topk_overlap'] for c in compare]):.3f}, "
+          f"same answer {np.mean([c['same_answer'] for c in compare]):.3f} "
+          f"(the LLM runs at temperature 0.1, so answers can differ even for the same context)")
 
 
 # ----------------------------------------------------------------------------- report (steps 6, 7)
@@ -390,10 +441,15 @@ def cmd_report(a):
     # --- Step 3 + 6: stage 1 and the matched-recall headline
     s1 = [r for r in step("3-stage1") if r["mode"] == "time"]
     md.append("## Step 3: Stage 1 (course queries)\n")
-    curve = [dict(host=h, corpus=c, index=i, M=M, efc=e, ef=ef, recall=med(g, "recall_at_k"), p50_us=med(g, "p50_us"),
-                  p95_us=med(g, "p95_us"), batch_qps=med(g, "batch_qps"), ndis_per_q=med(g, "ndis_per_q"))
+    curve = [dict(host=h, corpus=c, index=i, M=M, efc=e, ef=ef, recall=med(g, "recall_at_k"),
+                  recall_at_1=med(g, "recall_at_1"), recall_at_5=med(g, "recall_at_5"), p50_us=med(g, "p50_us"),
+                  p95_us=med(g, "p95_us"), p99_us=med(g, "p99_us"), batch_qps=med(g, "batch_qps"),
+                  ndis_per_q=med(g, "ndis_per_q"), search_peak_rss_mb=med(g, "search_peak_rss_mb"))
              for (h, c, i, M, e, ef), g in group(s1, "host", "corpus", "index", "M", "efc", "ef").items()]
-    md.append(md_table(curve, ["host", "corpus", "index", "M", "efc", "ef", "recall", "p50_us", "p95_us", "batch_qps", "ndis_per_q"]))
+    md.append("recall = recall@10 against exact search; recall_at_1/5 from the same results. search_peak_rss_mb is the "
+              "search process's peak memory (index + Python + libraries).\n\n")
+    md.append(md_table(curve, ["host", "corpus", "index", "M", "efc", "ef", "recall", "recall_at_1", "recall_at_5", "p50_us",
+                               "p95_us", "p99_us", "batch_qps", "ndis_per_q", "search_peak_rss_mb"]))
     write_rows(out / "stage1_curve.csv", curve) if curve else None
 
     headline = []
@@ -405,21 +461,28 @@ def cmd_report(a):
             hit = next((r for r in hn if r["recall"] >= t), None)
             row = dict(host=h, corpus=c, target=t, hnsw_ef=hit["ef"] if hit else "not reached",
                        hnsw_p50_us=hit["p50_us"] if hit else "", hnsw_batch_qps=hit["batch_qps"] if hit else "")
-            for kind in ("flat", "numpy"):
+            for kind in ("exact_dense", "faiss_exact"):
                 if kind in ex:
                     row[f"{kind}_p50_us"] = ex[kind]["p50_us"]
                     row[f"{kind}_batch_qps"] = ex[kind]["batch_qps"]
-            if hit and "flat" in ex:
-                row["speedup_vs_flat"] = ex["flat"]["p50_us"] / hit["p50_us"]
+                    if hit:
+                        row[f"speedup_vs_{kind}"] = ex[kind]["p50_us"] / hit["p50_us"]
             if "hnsw" in src:
                 r0 = src["hnsw"]
                 row.update(hnsw_bytes_per_vec=fnum(r0["index_bytes"]) / fnum(r0["n"]), build_s=fnum(r0["build_s"]),
+                           build_total_s=fnum(r0.get("build_total_s", "")), build_threads=r0.get("build_threads", ""),
                            build_peak_rss_mb=fnum(r0["build_peak_rss_mb"]))
+            if "exact_dense" in src:
+                row["exact_bytes_per_vec"] = fnum(src["exact_dense"]["index_bytes"]) / fnum(src["exact_dense"]["n"])
             headline.append(row)
     md.append("## Step 6: matched-recall headline (recall@10 vs exact)\n")
-    md.append(md_table(headline, ["host", "corpus", "target", "hnsw_ef", "hnsw_p50_us", "flat_p50_us", "numpy_p50_us",
-                                  "speedup_vs_flat", "hnsw_batch_qps", "flat_batch_qps", "hnsw_bytes_per_vec",
-                                  "build_s", "build_peak_rss_mb"]))
+    md.append("p50 = single-query latency. ExactDenseRetriever has no batched call, so only FAISS exact has a batched figure. "
+              "build_s = HNSW graph construction only (index.add); build_total_s adds reading the vectors and saving the index. "
+              "Exact search has no build.\n\n")
+    md.append(md_table(headline, ["host", "corpus", "target", "hnsw_ef", "hnsw_p50_us", "exact_dense_p50_us", "faiss_exact_p50_us",
+                                  "speedup_vs_exact_dense", "speedup_vs_faiss_exact", "hnsw_batch_qps", "faiss_exact_batch_qps",
+                                  "hnsw_bytes_per_vec", "exact_bytes_per_vec", "build_s", "build_total_s", "build_threads",
+                                  "build_peak_rss_mb"]))
 
     # --- Step 4 + 7: reordering wall clock, random-seed spread, break-even
     s4 = [r for r in step("4-reorder") if r["mode"] == "time"]
@@ -513,10 +576,39 @@ def cmd_report(a):
         qs.append(dict(host=h, corpus=c, index=i, order=o, ef=ef, fiqa_recall=med(g, "recall_at_k"), fiqa_p50_us=med(g, "p50_us"),
                        course_recall=med(ref, "recall_at_k") if ref else "", course_p50_us=med(ref, "p50_us") if ref else ""))
     md.append("## Step 10: query-set robustness (FiQA-extra vs course)\n\n" + md_table(qs, ["host", "corpus", "index", "order", "ef", "course_recall", "fiqa_recall", "course_p50_us", "fiqa_p50_us"]))
-    pl = step("11-pipeline")
-    pt = [dict(retriever=rn, n=len(g), **{c: med(g, c) for c in ("asr_ms", "embedding_ms", "retrieval_ms", "generation_ms", "end_to_end_ms", "retrieval_share")})
+    pl = [r for r in step("11-pipeline") if r["file"] == "rows.csv"]
+    qcols = [c for c in (pl[0] if pl else {}) if c.split("@")[0] in ("recall", "mrr", "ndcg")]
+    pt = [dict(retriever=rn, n=len(g),
+               **{c: med(g, c) for c in ("asr_ms", "embedding_ms", "retrieval_ms", "retrieval_call_ms", "generation_ms",
+                                         "end_to_end_ms", "retrieval_share")},
+               **{c: float(np.mean([fnum(r[c]) for r in g if r[c] != ""] or [float("nan")])) for c in qcols})
           for (rn,), g in group(pl, "retriever").items()]
-    md.append("## Step 11: share of end-to-end time (medians)\n\n" + md_table(pt, ["retriever", "n", "asr_ms", "embedding_ms", "retrieval_ms", "generation_ms", "end_to_end_ms", "retrieval_share"]))
+    md.append("## Step 11: the full pipeline, exact_dense vs HNSW (dev queries)\n\n"
+              "Times are medians; qrels metrics are means over dev queries with qrels. retrieval_call_ms is the whole "
+              "retrieve() call; retrieval_share = retrieval_call_ms / end_to_end_ms.\n\n"
+              + md_table(pt, ["retriever", "n", "asr_ms", "embedding_ms", "retrieval_ms", "retrieval_call_ms", "generation_ms",
+                              "end_to_end_ms", "retrieval_share"] + qcols))
+    cmp_ = [r for r in step("11-pipeline") if r["file"] == "rows-compare.csv"]
+    if cmp_:
+        frac = lambda c: float(np.mean([r[c] == "True" for r in cmp_]))
+        md.append("\nWhat changes for the user (per dev query, HNSW vs exact_dense):\n\n" + md_table(
+            [dict(n=len(cmp_), same_transcript=frac("same_transcript"), median_topk_overlap=med(cmp_, "topk_overlap"),
+                  same_context=frac("same_context"), same_answer=frac("same_answer"))],
+            ["n", "same_transcript", "median_topk_overlap", "same_context", "same_answer"]))
+        md.append("\nThe LLM runs at temperature 0.1, so answers can differ "
+                  "even with the same context: compare same_answer with same_context. Answers are in answers.jsonl.\n")
+
+    # --- perf (laptop): real hardware counters, warm cache
+    pr = [r for r in rows if r.get("mode") == "perf"]
+    if pr:
+        pcols = ["cycles_per_q", "instructions_per_q", "ipc", "LLC_loads_per_q", "LLC_load_misses_per_q",
+                 "L1_dcache_load_misses_per_q", "dTLB_load_misses_per_q", "ndis_per_q"]
+        ptab = [dict(host=h, corpus=c, index=i, ef=ef, order=o, rounds=len(g),
+                     **{col: med(g, col) for col in pcols if col in g[0]})
+                for (h, c, i, ef, o), g in group(pr, "host", "corpus", "index", "ef", "order").items()]
+        md.append("## Hardware counters (perf stat, warm cache, per query, median over rounds)\n\n"
+                  + md_table(ptab, ["host", "corpus", "index", "ef", "order", "rounds"] + pcols))
+        write_rows(out / "perf.csv", ptab)
     dg = [r for r in step("diag") if r["file"] == "rows.csv"]
     gp = [r for r in step("diag") if r["file"] == "rows-gaps.csv"]
     md.append("## Graph diagnostics\n\n" + md_table(dg, [c for c in (dg[0] if dg else {}) if c not in ("step", "run", "file")]))
@@ -564,7 +656,8 @@ def main():
     p.add_argument("--name", default="24k", help="corpus label of the course corpus in the cache")
     p.add_argument("--data-dir", default=str(ROOT / "data" / "rag_corpus"))
     p.add_argument("--settings", required=True)
-    p.add_argument("--n", type=int, default=20)
+    p.add_argument("--n", type=int, default=None, help="first N dev queries only (default: all dev queries)")
+    p.add_argument("--qrels", default=None, help="default: <data-dir>/qrels_dev.tsv")
     p.add_argument("--k", type=int, default=5)
     p.add_argument("--device", default=None)
     p.add_argument("--out", required=True)

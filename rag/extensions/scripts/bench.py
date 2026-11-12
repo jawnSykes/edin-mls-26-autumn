@@ -1,7 +1,8 @@
 """Search benchmark: one CSV row per cell, each cell measured in its own child process.
 
 A cell is one (index kind, M, efConstruction, order, efSearch, SIMD level, simulated LL size).
-Every combination of the list-valued flags is a cell.
+Every combination of the list-valued flags is a cell. Index kinds: exact_dense (the course's
+ExactDenseRetriever, called as the pipeline calls it), faiss_exact (FAISS IndexFlatIP) and hnsw.
 
   --mode time        pinned, single-threaded wall clock: p50/p95/p99 per query, batched QPS,
                      FAISS work counters. Cells are interleaved over shuffled --rounds.
@@ -114,14 +115,15 @@ def _save_meta(path, **kw):
     path.with_name(path.name + ".meta.json").write_text(json.dumps(kw))
 
 
-def prepare_numpy(args, cache, M, efc):
+def prepare_exact_dense(args, cache, M, efc):
+    """The course's ExactDenseRetriever (src/retriever.py): no build, just the vector matrix."""
     X = np.load(args.embeddings, mmap_mode="r")
     return dict(path=args.embeddings, build_s=0.0, index_bytes=X.size * 4, n=X.shape[0], d=X.shape[1])
 
 
-def prepare_flat(args, cache, M, efc):
+def prepare_faiss_exact(args, cache, M, efc):
     import faiss
-    path = cache / "flat.faiss"
+    path = cache / "flat.faiss"  # file name kept, so existing caches are reused
     if not path.exists():
         X = np.ascontiguousarray(np.load(args.embeddings), dtype=np.float32)
         t = time.perf_counter()
@@ -142,22 +144,31 @@ def prepare_hnsw(args, cache, M, efc):
     r = HNSWRetriever(args.embeddings, args.ids, M=M, efConstruction=efc, efSearch=16)
     path = Path(r.index_path)
     if not r.loaded:
-        _save_meta(path, build_s=time.perf_counter() - t, build_threads=faiss.omp_get_max_threads(),
+        # build_s: graph construction only (index.add). build_total_s adds loading the .npy,
+        # the norm check and writing the index. Peak RSS is this whole process's, so it
+        # includes anything loaded before the build: an upper bound.
+        _save_meta(path, build_s=r.build_s, build_total_s=time.perf_counter() - t,
+                   build_threads=faiss.omp_get_max_threads(),
                    build_peak_rss_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
     print(f"[prepare] {path.name}: {'loaded' if r.loaded else 'built'}", flush=True)
     m = _meta(path)
-    return dict(path=path, build_s=m.get("build_s", float("nan")),
+    return dict(path=path, build_s=m.get("build_s", float("nan")), build_total_s=m.get("build_total_s", float("nan")),
+                build_threads=m.get("build_threads", ""),
                 build_peak_rss_mb=m.get("build_peak_rss_mb", float("nan")), index_bytes=path.stat().st_size,
                 n=r.index.ntotal, d=r.index.d)
 
 
-INDEXES = {"numpy": prepare_numpy, "flat": prepare_flat, "hnsw": prepare_hnsw}
+# exact_dense: the current method, the course's ExactDenseRetriever itself (numpy matmul + top-k)
+# faiss_exact: the same exact search in FAISS (IndexFlatIP), to separate library from algorithm
+# hnsw:        the graph index
+INDEXES = {"exact_dense": prepare_exact_dense, "faiss_exact": prepare_faiss_exact, "hnsw": prepare_hnsw}
 
 
 # ----------------------------------------------------------------------------- child process
 
 def child(cfg):
-    """Modes: 'check' (reorder correctness), 'time', 'cg' (under valgrind; cfg['search'] on/off)."""
+    """Modes: 'check' (reorder correctness), 'time', 'cg' (under valgrind) and 'perf' (under
+    perf stat); cg and perf run twice, cfg['search'] on/off, and the parent subtracts."""
     if cfg["cpu"] is not None:
         os.sched_setaffinity(0, {cfg["cpu"]})
     import faiss
@@ -167,13 +178,16 @@ def child(cfg):
     Q = np.ascontiguousarray(np.load(cfg["queries"])[:cfg["nq"]], dtype=np.float32)
     stats = faiss.cvar.hnsw_stats
 
-    if kind == "numpy":
-        X = np.ascontiguousarray(np.load(cfg["path"]), dtype=np.float32)
+    if kind == "exact_dense":
+        from src.retriever import ExactDenseRetriever
+        r = ExactDenseRetriever(cfg["path"], cfg["ids"])
+        row_of = {rid: i for i, rid in enumerate(r.record_ids)}
 
-        def search(q):
-            s = q @ X.T
-            idx = np.argpartition(-s, k - 1, axis=1)[:, :k]
-            return np.take_along_axis(idx, np.argsort(-np.take_along_axis(s, idx, 1), 1), 1)
+        def search_one(q):  # what is timed and profiled: the retriever's own call, as the pipeline makes it
+            return r.retrieve(q[0], k)
+
+        def search(q):  # row indices, for recall (outside the timed region)
+            return np.array([[row_of[x] for x in search_one(q)["record_ids"]]])
     else:
         index = faiss.read_index(cfg["path"])
         if kind == "hnsw":
@@ -184,6 +198,8 @@ def child(cfg):
 
         def search_d(q):
             return index.search(q, k)
+
+        search_one = search
 
     def one_pass():
         stats.reset()
@@ -206,9 +222,33 @@ def child(cfg):
                    ndis_rel_diff=abs(ndis - ndis_ref) / max(ndis_ref, 1))
     else:
         perm = apply_order(index, np.load(cfg["perm"])["perm"]) if cfg["perm"] else None
+
+        def plain_pass():
+            for i in range(len(Q)):
+                search_one(Q[i:i + 1])
+
         if cfg["mode"] == "cg":
             if cfg["search"]:
-                _, out["ndis"], out["nhops"] = one_pass()
+                stats.reset()
+                plain_pass()
+                out["ndis"], out["nhops"] = int(stats.ndis), int(stats.nhops)
+        elif cfg["mode"] == "perf":
+            # Under `perf stat -D -1 --control`: counters start disabled and are switched on only
+            # around the timed passes, so start-up, loading and the warm-up pass never count.
+            plain_pass()  # warm-up
+            ctl, ack = open(cfg["perf_ctl"], "w"), open(cfg["perf_ack"])
+
+            def perf_cmd(c):
+                ctl.write(c + "\n")
+                ctl.flush()
+                ack.readline()
+
+            stats.reset()
+            perf_cmd("enable")
+            for _ in range(cfg["reps"]):
+                plain_pass()
+            perf_cmd("disable")
+            out["ndis"], out["nhops"] = int(stats.ndis), int(stats.nhops)
         else:
             I, ndis, nhops = one_pass()  # also the warm-up pass
             if perm is not None:
@@ -219,17 +259,25 @@ def child(cfg):
             for _ in range(cfg["reps"]):
                 for i in range(len(Q)):
                     t = time.perf_counter_ns()
-                    search(Q[i:i + 1])
+                    search_one(Q[i:i + 1])
                     lat[j] = time.perf_counter_ns() - t
                     j += 1
-            t = time.perf_counter()
-            search(Q)  # batched: all queries in one call, still 1 thread
-            batch_s = time.perf_counter() - t
+            if kind == "exact_dense":
+                batch_qps = float("nan")  # ExactDenseRetriever has no batched call
+            else:
+                t = time.perf_counter()
+                search(Q)  # batched: all queries in one call, still 1 thread
+                batch_qps = len(Q) / (time.perf_counter() - t)
             us = lat / 1e3
             out = dict(p50_us=np.percentile(us, 50), p95_us=np.percentile(us, 95), p99_us=np.percentile(us, 99),
-                       mean_us=us.mean(), batch_qps=len(Q) / batch_s,
+                       mean_us=us.mean(), batch_qps=batch_qps,
                        ndis_per_q=ndis / len(Q), nhops_per_q=nhops / len(Q),
-                       recall_at_k=float(np.mean([len(set(I[i]) & set(gt[i])) / k for i in range(len(Q))])))
+                       recall_at_k=float(np.mean([len(set(I[i]) & set(gt[i])) / k for i in range(len(Q))])),
+                       # recall@r vs exact top-r, from the same top-k results
+                       **{f"recall_at_{r_}": float(np.mean([len(set(I[i, :r_]) & set(gt[i, :r_])) / r_ for i in range(len(Q))]))
+                          for r_ in (1, 5) if r_ < k},
+                       # peak RSS of this search process (index + Python + numpy/FAISS), in MB
+                       search_peak_rss_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
     out.update(simd_level=faiss.SIMDConfig.get_level_name(), faiss_version=faiss.__version__)
     print("RESULT " + json.dumps({k_: (v if isinstance(v, str) else float(v)) for k_, v in out.items()}), flush=True)
 
@@ -239,8 +287,26 @@ def child(cfg):
 CG_RE = re.compile(r"==\d+==\s+(D\s+refs|D1\s+misses|LLd\s+misses):\s+([\d,]+)")
 
 
-def run_child(cfg, log, simd=None, valgrind=None):
-    """Run one child, log its output, return (RESULT dict, valgrind counters)."""
+PERF_EVENTS = "cycles:u,instructions:u,LLC-loads:u,LLC-load-misses:u,L1-dcache-load-misses:u,dTLB-load-misses:u"
+
+
+def parse_perf(path):
+    """perf stat -x, output -> {event: count}. On hybrid Intel each event is reported per core
+    type (cpu_core/..., cpu_atom/...); the child is pinned to one core, so the counts are summed."""
+    counts = {}
+    for line in Path(path).read_text().splitlines():
+        f = line.split(",")
+        if len(f) < 3 or not f[0].replace(".", "", 1).isdigit():
+            continue  # comments, blank lines, <not counted>, <not supported>
+        ev = f[2].split("/")[-2] if "/" in f[2] else f[2]
+        ev = ev.split(":")[0].replace("-", "_")
+        counts[ev] = counts.get(ev, 0) + float(f[0])
+    return counts
+
+
+def run_child(cfg, log, simd=None, valgrind=None, perf_out=None):
+    """Run one child, log its output, return (RESULT dict, valgrind or perf counters).
+    `valgrind` is a command prefix (valgrind or perf stat); `perf_out` the perf stat output file."""
     cmd = [sys.executable, str(Path(__file__).resolve()), "_child", json.dumps(cfg)]
     if valgrind:
         cmd = valgrind + cmd
@@ -255,7 +321,11 @@ def run_child(cfg, log, simd=None, valgrind=None):
         raise RuntimeError(f"child failed (rc={proc.returncode}), see {log}\n{proc.stderr[-2000:]}")
     counters = {re.sub(r"\s+", "_", m.group(1)): int(m.group(2).replace(",", ""))
                 for m in CG_RE.finditer(proc.stderr)}
-    if valgrind and "LLd_misses" not in counters:
+    if perf_out:
+        counters = parse_perf(perf_out)
+        if "cycles" not in counters:
+            raise RuntimeError(f"no perf counts in {perf_out}")
+    elif valgrind and "LLd_misses" not in counters:
         raise RuntimeError(f"no cachegrind summary in {log}")
     return json.loads(lines[-1][len("RESULT "):]), counters
 
@@ -319,7 +389,7 @@ def main():
     ap.add_argument("--order", nargs="+", default=["identity"], help="identity, random:<seed>, bfs, gorder:<w>")
     ap.add_argument("--simd", nargs="+", default=[None], help="FAISS_SIMD_LEVEL per cell (default: inherit env)")
     ap.add_argument("--k", type=int, default=10)
-    ap.add_argument("--mode", choices=["time", "cachegrind"], default="time")
+    ap.add_argument("--mode", choices=["time", "cachegrind", "perf"], default="time")
     ap.add_argument("--reps", type=int, default=5, help="timed passes over all queries per cell per round")
     ap.add_argument("--rounds", type=int, default=3, help="interleaved rounds (time mode)")
     ap.add_argument("--seed", type=int, default=0, help="shuffles the interleaving only")
@@ -327,6 +397,8 @@ def main():
     ap.add_argument("--LL", nargs="+", type=int, default=[8 << 20], help="cachegrind: simulated LL bytes (16-way, 64B)")
     ap.add_argument("--D1", default=os.environ.get("D1", ""), help="cachegrind: size,ways,line (default: $D1)")
     ap.add_argument("--valgrind", default=os.environ.get("VALGRIND", "valgrind"))
+    ap.add_argument("--perf", default=os.environ.get("PERF", "perf"), help="perf mode: the perf binary")
+    ap.add_argument("--perf-events", default=PERF_EVENTS, help="perf mode: events for perf stat -e")
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--log-dir", type=Path, required=True, help="per-cell logs and cachegrind files (scratch)")
@@ -343,6 +415,7 @@ def main():
     cache = Path(os.environ["PERSIST_INDEX_PATH"]).expanduser() / args.name
     cache.mkdir(parents=True, exist_ok=True)
     cg = args.mode == "cachegrind"
+    pf = args.mode == "perf"
     if cg and not args.D1:
         raise SystemExit("cachegrind mode needs --D1 size,ways,line (or $D1)")
     if cg and any((lv or os.environ.get("FAISS_SIMD_LEVEL")) not in (None, "", "AVX2", "NONE") for lv in args.simd):
@@ -388,6 +461,8 @@ def main():
     base = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **machine_info(), "pinned_cpu": cpu, **freq_state(cpu),
             "mode": args.mode, "tag": args.tag, "corpus": args.name, "queries": args.queries.stem,
             "nq": nq, "k": args.k, "reps": 0 if cg else args.reps}
+    if pf:
+        base["perf_events"] = args.perf_events
     args.out.parent.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     summary, total, done = {}, len(cells) * rounds, 0
@@ -396,11 +471,12 @@ def main():
             kind, M, efc, info, order, (p, reorder_s, phash), ef, simd, LL = cells[ci]
             done += 1
             cid = f"{kind}-M{M}-efc{efc}-{order.replace(':', '-')}-ef{ef}-{simd}-LL{LL}-r{rnd}"
-            cfg = dict(kind=kind, path=str(info["path"]), perm=str(p) if p else None, queries=str(args.queries),
-                       gt=str(gt), nq=nq, k=args.k, ef=ef, reps=args.reps, cpu=cpu)
+            cfg = dict(kind=kind, path=str(info["path"]), ids=str(args.ids), perm=str(p) if p else None,
+                       queries=str(args.queries), gt=str(gt), nq=nq, k=args.k, ef=ef, reps=args.reps, cpu=cpu)
             row = {**base, "round": rnd, "index": kind, "M": M, "efc": efc, "order": order, "ef": ef,
                    "simd_requested": simd or os.environ.get("FAISS_SIMD_LEVEL", ""), "perm_sha1": phash,
                    "reorder_s": round(reorder_s, 4), "build_s": info.get("build_s"),
+                   "build_total_s": info.get("build_total_s", ""), "build_threads": info.get("build_threads", ""),
                    "build_peak_rss_mb": info.get("build_peak_rss_mb", ""), "index_bytes": info["index_bytes"],
                    "n": info["n"], "d": info["d"]}
             if cg:
@@ -418,6 +494,29 @@ def main():
                            LL_miss_per_ndis=net["LLd_misses"] / res["ndis"] if res.get("ndis") else "")
                 msg = f"D1/q={row['D1_miss_per_q']:.0f} LL/q={row['LL_miss_per_q']:.0f} LL={LL >> 20}MiB"
                 key_cols = ["LL_miss_per_q"]
+            elif pf:
+                # Real hardware counters, warm cache, per query. The child switches the counters on
+                # only around its timed passes (perf's control FIFOs), so nothing else counts.
+                fifo_dir = args.log_dir / f"{cid}-fifo"
+                fifo_dir.mkdir(parents=True, exist_ok=True)
+                ctl, ack, pout = fifo_dir / "ctl", fifo_dir / "ack", args.log_dir / f"{cid}.perf"
+                for f_ in (ctl, ack):
+                    if not f_.exists():
+                        os.mkfifo(f_)
+                pcmd = [args.perf, "stat", "-D", "-1", "--control", f"fifo:{ctl},{ack}", "-x,", "-o", str(pout),
+                        "-e", args.perf_events, "--"]
+                res, net = run_child({**cfg, "mode": "perf", "perf_ctl": str(ctl), "perf_ack": str(ack)},
+                                     args.log_dir / f"{cid}.log", simd, pcmd, pout)
+                nqs = nq * args.reps
+                row.update(simd_level=res["simd_level"], faiss_version=res["faiss_version"],
+                           ndis_per_q=res.get("ndis", 0) / nqs, nhops_per_q=res.get("nhops", 0) / nqs,
+                           **{f"{key}_total": v for key, v in net.items()},
+                           **{f"{key}_per_q": v / nqs for key, v in net.items()},
+                           ipc=net["instructions"] / net["cycles"] if net.get("cycles") else "",
+                           LLC_miss_per_ndis=net.get("LLC_load_misses", 0) / res["ndis"] if res.get("ndis") else "")
+                msg = (f"cycles/q={row['cycles_per_q']:.0f} ipc={row['ipc']:.2f} "
+                       f"LLC-miss/q={row.get('LLC_load_misses_per_q', float('nan')):.0f}")
+                key_cols = ["cycles_per_q", "LLC_load_misses_per_q"]
             else:
                 res, _ = run_child({**cfg, "mode": "time"}, args.log_dir / f"{cid}.log", simd)
                 row.update(res)
