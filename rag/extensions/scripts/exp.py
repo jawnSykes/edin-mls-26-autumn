@@ -5,7 +5,7 @@
   diag      graph diagnostics: degree, hubness, reachability, memory split, link id gap per ordering
   quality   step 9: qrels recall/MRR/NDCG@10 on course dev queries, exact vs HNSW
   pipeline  step 11: per-stage pipeline timings (ASR, encode, retrieve, generate) -> retrieval share
-  report    steps 6-7 (+ 2, 5, 8, 10): tables and plots from every rows*.csv under $RESULTS_DIR
+  report    steps 6-7 (+ 2, 5, 9, 10, 11): tables and plots from every rows*.csv under $RESULTS_DIR
 
 Normally run via run_experiments.sbatch. Corpora are given as name=path/to/corpus_enc_a.npy.
 """
@@ -501,19 +501,6 @@ def cmd_report(a):
             md.append(f"![recall vs latency {h}](recall_latency_{h}.png)\n")
     if not plt:
         md.append("_matplotlib not installed: plots skipped; plot from the CSVs in this folder._\n")
-
-    # --- Step 8: SIMD sensitivity
-    s8 = [r for r in step("8-simd") if r["mode"] == "time"]
-    simd = []
-    for (h, c, i, ef), g in group(s8, "host", "corpus", "index", "ef").items():
-        by = {lv: med(gg, "p50_us") for (lv,), gg in group(g, "simd_level").items()}
-        row = dict(host=h, corpus=c, index=i, ef=ef, **{f"p50_{k_}": v for k_, v in by.items()})
-        for lv in by:
-            if lv != "AVX2" and "AVX2" in by:
-                row[f"speedup_{lv}"] = by["AVX2"] / by[lv]
-        simd.append(row)
-    cols = list(dict.fromkeys(c for r in simd for c in r))
-    md.append("## Step 8: SIMD sensitivity (speedup = AVX2 p50 / level p50)\n\n" + md_table(simd, cols))
 
     # --- Step 9, 10, 11, diag
     q = step("9-quality")

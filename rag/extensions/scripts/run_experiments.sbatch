@@ -33,8 +33,12 @@
 #SBATCH --output=ann-experiments-%j.out
 
 set -euo pipefail
+# Jobs inherit the login node's soft virtual-memory cap (512000 KB on the Teaching cluster), and
+# loading faiss's native library alone needs more than that: it segfaults on import. The hard
+# limit is unlimited, so lift the soft one for this job and everything it starts.
+ulimit -v "$(ulimit -Hv)"
 
-STEPS="${STEPS:-1-setup 2-tune 3-stage1 4-reorder 5-cachesweep 8-simd 9-quality 10-queryset 11-pipeline diag report}"
+STEPS="${STEPS:-1-setup 2-tune 3-stage1 4-reorder 5-cachesweep 9-quality 10-queryset 11-pipeline diag report}"
 # ---------------------------------------------------------------- environment
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     cd "$SLURM_SUBMIT_DIR"
@@ -79,7 +83,6 @@ RANDOM_SEEDS_TIME="${RANDOM_SEEDS_TIME:-0 1 2 3 4}"
 RANDOM_SEEDS_CG="${RANDOM_SEEDS_CG:-0 1 2}"
 GORDER_WS="${GORDER_WS:-3 5 10}"
 LLS="${LLS:-1 2 4 8 16 32 64 128}"          # MiB
-SIMDS="${SIMDS:-AVX2 AVX512 AVX512_SPR}"     # step 8
 ROUNDS="${ROUNDS:-3}"; ROUNDS_REORDER="${ROUNDS_REORDER:-5}"; REPS="${REPS:-5}"
 TUNE_REPS="${TUNE_REPS:-1}"; GW_NQ="${GW_NQ:-500}"; SMOKE_NQ="${SMOKE_NQ:-20}"; NQ="${NQ:-}"
 JOBS="${JOBS:-${SLURM_CPUS_PER_TASK:-4}}"
@@ -96,7 +99,8 @@ fail() { echo "!! $*" >&2; exit 1; }
 check_env() {
     echo "== environment check on $(hostname -s)"
     echo "  results $RESULTS_DIR | cache $PERSIST_INDEX_PATH | scratch $SCRATCH_DIR"
-    "$PY" - <<'EOF' || fail "python environment check failed"
+    echo "  cpu: $(lscpu | sed -n 's/^Model name: *//p') | cpus allowed $(nproc) | vmem limit $(ulimit -v)"
+    "$PY" -X faulthandler - <<'EOF' || fail "python environment check failed (a crash prints the failing line above)"
 import os, sys
 import numpy, scipy, faiss
 assert tuple(map(int, faiss.__version__.split(".")[:2])) >= (1, 15), f"faiss {faiss.__version__} < 1.15"
@@ -113,19 +117,6 @@ EOF
         [[ -f "$SETTINGS" ]] || fail "$SETTINGS missing: run 2-tune first"
     fi
     echo "  data files ok"
-
-    if has_step 8-simd; then
-        if grep -qw avx512f /proc/cpuinfo; then
-            local lv got
-            for lv in $SIMDS; do
-                got="$(FAISS_SIMD_LEVEL=$lv "$PY" -c 'import faiss; print(faiss.SIMDConfig.get_level_name())')"
-                [[ "$got" == "$lv" ]] || fail "FAISS_SIMD_LEVEL=$lv gives $got (fix SIMDS)"
-            done
-            echo "  SIMD levels ok: $SIMDS"
-        else
-            echo "  no AVX-512 on this CPU: skipping 8-simd"; STEPS="${STEPS/8-simd/}"
-        fi
-    fi
 
     if has_step 1-setup || has_step 2-tune || has_step 5-cachesweep; then
         VALGRIND="${VALGRIND:-$(command -v valgrind || true)}"
@@ -183,7 +174,7 @@ write_env() {
         echo "FAISS_SIMD_LEVEL=$FAISS_SIMD_LEVEL BENCH_CPU=${BENCH_CPU:-} JOBS=$JOBS"
         [[ -n "${VALGRIND:-}" ]] && echo "valgrind: $VALGRIND ($("$VALGRIND" --version)) D1=$D1"
         echo "CORPORA=$CORPORA"; echo "COURSE_QV=$COURSE_QV FIQA_QV=$FIQA_QV QRELS=$QRELS"
-        echo "MS=$MS EFCS=$EFCS EFS=$EFS LLS=$LLS GORDER_WS=$GORDER_WS SIMDS=$SIMDS"
+        echo "MS=$MS EFCS=$EFCS EFS=$EFS LLS=$LLS GORDER_WS=$GORDER_WS"
         echo "RANDOM_SEEDS_TIME=$RANDOM_SEEDS_TIME RANDOM_SEEDS_CG=$RANDOM_SEEDS_CG"
         echo "ROUNDS=$ROUNDS ROUNDS_REORDER=$ROUNDS_REORDER REPS=$REPS TUNE_REPS=$TUNE_REPS GW_NQ=$GW_NQ NQ=$NQ"
         if [[ -f "$SETTINGS" ]]; then echo "settings.json:"; cat "$SETTINGS"; fi
@@ -259,12 +250,6 @@ step_5_cachesweep() {
     done
     (( bad == 0 )) || fail "some cache-sweep runs failed (see above)"
 }
-
-simd() {
-    bench "$1" "$2" rows.csv --queries "$QCOURSE" --index flat hnsw --M "$(setting "$1" M)" --efc "$(setting "$1" efc)" \
-        --ef "$(setting "$1" ef95)" --simd $SIMDS --rounds "$ROUNDS_REORDER" --reps "$REPS"
-}
-step_8_simd() { each_corpus simd; }
 
 step_9_quality() {
     $EXP quality --cache "$PERSIST_INDEX_PATH" --corpus $CORPORA --queries "$QCOURSE" --qrels "$QRELS" \
