@@ -138,6 +138,9 @@ i.search(np.random.rand(5, 16).astype("float32"), 5)' > "$WORK/preflight.log" 2>
             export PATH=/opt/cuda-12.8.0/bin:$PATH HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
             export RAG_ASR_PYTHON="${RAG_ASR_PYTHON:-${CONDA_BASE:-$HOME/miniconda3}/envs/mls-asr/bin/python}"
             [[ -x "$RAG_ASR_PYTHON" ]] || fail "ASR python not found: $RAG_ASR_PYTHON (set RAG_ASR_PYTHON)"
+            if [[ "${ASR_CUDA:-all}" != none ]]; then
+                command -v nvcc >/dev/null || fail "nvcc not found (needed to build the hw1 ASR kernels; or set ASR_CUDA=none)"
+            fi
             grep -q '^ELM_API_KEY=.' rag/.env 2>/dev/null || [[ -n "${ELM_API_KEY:-}" ]] || fail "ELM_API_KEY not set (rag/.env)"
             echo "  $(nvidia-smi -L | head -1); ASR $RAG_ASR_PYTHON; ELM key set"
         else
@@ -263,7 +266,14 @@ queryset() {
 }
 step_10_queryset() { each_corpus queryset; }
 
-step_11_pipeline() { $EXP pipeline --cache "$PERSIST_INDEX_PATH" --settings "$SETTINGS" --device "${DEVICE:-cpu}" --n "${PIPE_N:-20}" --out "$OUT"; }
+step_11_pipeline() {
+    # ASR runs on the hw1 CUDA kernels (ASR_CUDA, default all), compiled per GPU type into
+    # hw1-asr/build/sm_XX/; build them for this node's GPU (a no-op when already built).
+    # ASR_CUDA=none uses the PyTorch reference instead and needs no build.
+    if [[ "${ASR_CUDA:-all}" != none ]]; then
+        make -s -C "${RAG_ASR_ROOT:-hw1-asr}" lib
+    fi
+    $EXP pipeline --cache "$PERSIST_INDEX_PATH" --settings "$SETTINGS" --device "${DEVICE:-cpu}" --n "${PIPE_N:-20}" --out "$OUT"; }
 
 step_diag() {
     local names="" spec; for spec in $CORPORA; do names="$names ${spec%%=*}"; done
