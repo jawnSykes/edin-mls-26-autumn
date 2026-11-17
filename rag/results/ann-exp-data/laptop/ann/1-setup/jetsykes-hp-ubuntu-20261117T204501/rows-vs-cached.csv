@@ -1,0 +1,5 @@
+item,nq,identical,rows_identical,top10_sets_identical
+gt-course-k100.npy,475,False,0.9810526315789474,1.0
+gt-fiqa_extra-k100.npy,6173,False,0.9865543495869108,1.0
+queries/course.npy,,True,,
+queries/course_ids.json,,True,,
