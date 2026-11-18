@@ -1,13 +1,11 @@
 """Everything in the experiment sequence that isn't a timed bench.py cell.
 
-  prep      step 1: FiQA-extra query set, exact top-100 ground truth, FAISS-vs-numpy exact check
-  pick      step 2: choose (M, efC), efSearch for 0.95/0.99 recall and Gorder's w -> settings.json
-  diag      graph diagnostics: degree, hubness, reachability, memory split, link id gap per ordering
+  prep      step 1: course query set, exact top-100 ground truth, FAISS-vs-numpy exact check
   quality   step 9: qrels recall/MRR/NDCG@10 on course dev queries, exact vs HNSW
   pipeline  step 11: per-stage pipeline timings (ASR, encode, retrieve, generate) -> retrieval share
-  report    steps 6-7 (+ 2, 5, 9, 10, 11): tables and plots from every rows*.csv under $RESULTS_DIR
 
-Normally run via run_experiments.sbatch. Corpora are given as name=path/to/corpus_enc_a.npy.
+Run via laptop_rerun.py (prep, quality) or run_experiments.sbatch (prep, pipeline).
+Corpora are given as name=path/to/corpus_enc_a.npy.
 """
 from pathlib import Path
 import sys
@@ -19,9 +17,6 @@ if str(ROOT) not in sys.path:
 import argparse
 import csv
 import json
-import re
-import statistics
-import subprocess
 
 import numpy as np
 
@@ -40,7 +35,7 @@ def ids_for(npy):
 
 
 def exact_topk(Q, X, k, chunk=512):
-    """Exact inner-product top-k (sorted), in query chunks so 6.6k x 57.6k scores fit in memory."""
+    """Exact inner-product top-k (sorted), in query chunks to bound the score matrix."""
     out = np.empty((len(Q), k), dtype=np.int64)
     for s in range(0, len(Q), chunk):
         S = Q[s:s + chunk] @ X.T
@@ -73,24 +68,6 @@ def write_rows(path, rows):
     print(f"wrote {len(rows)} rows -> {path}")
 
 
-def fnum(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return float("nan")
-
-
-def med(rows, col):
-    return statistics.median(fnum(r.get(col, "")) for r in rows)  # missing column (older rows): nan
-
-
-def group(rows, *cols):
-    out = {}
-    for r in rows:
-        out.setdefault(tuple(r.get(c, "") for c in cols), []).append(r)
-    return out
-
-
 # ----------------------------------------------------------------------------- prep (step 1)
 
 def cmd_prep(a):
@@ -99,24 +76,15 @@ def cmd_prep(a):
     qdir = cache / "queries"
     qdir.mkdir(parents=True, exist_ok=True)
 
-    # Query sets: course (475, from cached ASR transcripts) and FiQA-extra (FiQA minus course queries).
-    course_ids = ids_for(a.course_queries)
-    course = np.load(a.course_queries).astype(np.float32)
-    fiqa_ids = ids_for(a.fiqa_queries)
-    fiqa = np.load(a.fiqa_queries).astype(np.float32)
-    course_set = set(course_ids)
-    keep = np.array([q not in course_set for q in fiqa_ids])
-    if (~keep).sum() != len(course_set):
-        raise SystemExit(f"only {(~keep).sum()} of {len(course_set)} course query ids found in the FiQA query set")
-    sets = {"course": (course, course_ids), "fiqa_extra": (fiqa[keep], [q for q, k in zip(fiqa_ids, keep) if k])}
+    # Query set: the 475 course queries (vectors of the cached ASR transcripts).
+    sets = {"course": (np.load(a.course_queries).astype(np.float32), ids_for(a.course_queries))}
     for name, (Q, ids) in sets.items():
         np.save(qdir / f"{name}.npy", Q)
         (qdir / f"{name}_ids.json").write_text(json.dumps(ids))
         print(f"[prep] queries/{name}.npy: {Q.shape}")
 
     check = {"faiss_version": faiss.__version__, "simd_level": faiss.SIMDConfig.get_level_name(),
-             "queries": {n: len(ids) for n, (Q, ids) in sets.items()},
-             "fiqa_removed_as_course": int((~keep).sum()), "exact_agreement": {}}
+             "queries": {n: len(ids) for n, (Q, ids) in sets.items()}, "exact_agreement": {}}
     for cname, path in corpora(a.corpus).items():
         X = np.ascontiguousarray(np.load(path), dtype=np.float32)
         (cache / cname).mkdir(parents=True, exist_ok=True)
@@ -145,100 +113,6 @@ def cmd_prep(a):
     out = Path(a.out) / "check.json"
     out.write_text(json.dumps(check, indent=2))
     print(f"wrote {out}")
-
-
-# ----------------------------------------------------------------------------- pick (step 2)
-
-def read_csvs(paths):
-    rows = []
-    for p in paths:
-        with open(p, newline="") as f:
-            rows += list(csv.DictReader(f))
-    return rows
-
-
-def cmd_pick(a):
-    rows = read_csvs(a.rows)
-    s = load_settings(a.settings)
-
-    t = [r for r in rows if r["mode"] == "time" and r["index"] == "hnsw" and r["order"] == "identity"]
-    for (corpus,), rs in group(t, "corpus").items():
-        cells = {}  # (M, efc) -> [(ef, recall, p50)]
-        for (M, efc, ef), g in group(rs, "M", "efc", "ef").items():
-            cells.setdefault((int(M), int(efc)), []).append((int(ef), med(g, "recall_at_k"), med(g, "p50_us")))
-        best = None
-        for (M, efc), pts in cells.items():
-            ok = sorted(p for p in pts if p[1] >= a.select_recall)
-            if ok and (best is None or ok[0][2] < best[2]):
-                best = (M, efc, ok[0][2])
-        if best is None:
-            print(f"!! {corpus}: no (M, efC) reaches recall {a.select_recall}; widen the ef sweep")
-            continue
-        M, efc, _ = best
-        pts = sorted(cells[(M, efc)])
-        entry = s.setdefault(corpus, {})
-        entry.update(M=M, efc=efc)
-        for target, key in [(0.95, "ef95"), (0.99, "ef99")]:
-            ok = [ef for ef, rec, _ in pts if rec >= target]
-            entry[key] = ok[0] if ok else pts[-1][0]
-            if not ok:
-                print(f"!! {corpus}: recall {target} not reached; using largest ef {pts[-1][0]}")
-        print(f"[pick] {corpus}: M={M} efc={efc} ef95={entry['ef95']} ef99={entry['ef99']}")
-
-    g = [r for r in rows if r["mode"] == "cachegrind" and r["order"].startswith("gorder:")]
-    for (corpus,), rs in group(g, "corpus").items():
-        by_w = {int(r["order"].split(":")[1]): fnum(r["LL_miss_per_q"]) for r in rs}
-        w = min(by_w, key=by_w.get)
-        s.setdefault(corpus, {})["gorder_w"] = w
-        print(f"[pick] {corpus}: gorder LL misses/q by w {by_w} -> w={w}")
-
-    Path(a.settings).write_text(json.dumps(s, indent=2))
-    print(f"wrote {a.settings}")
-
-
-# ----------------------------------------------------------------------------- diag
-
-def cmd_diag(a):
-    import faiss
-    from extensions.reorder import level0_csr, inverse
-    from scipy.sparse.csgraph import breadth_first_order
-    s = load_settings(a.settings)
-    graph_rows, gap_rows = [], []
-    for name in a.names:
-        M, efc = s[name]["M"], s[name]["efc"]
-        path = hnsw_path(a.cache, name, M, efc)
-        index = faiss.read_index(str(path))
-        n, d, h = index.ntotal, index.d, index.hnsw
-        A = level0_csr(index)
-        out_deg = np.diff(A.indptr)
-        in_deg = np.asarray(A.sum(axis=0)).ravel().astype(float)  # k-occurrence
-        top = np.sort(in_deg)[::-1][:max(1, n // 100)]
-        reach = len(breadth_first_order(A, int(h.entry_point), directed=True, return_predecessors=False))
-        n_links_total = faiss.vector_to_array(h.neighbors).size
-        graph_rows.append(dict(
-            corpus=name, M=M, efc=efc, n=n, max_level=h.max_level,
-            out_deg_mean=out_deg.mean(), out_deg_min=out_deg.min(), out_deg_max=out_deg.max(),
-            in_deg_mean=in_deg.mean(), in_deg_std=in_deg.std(), in_deg_max=in_deg.max(),
-            in_deg_skew=float(((in_deg - in_deg.mean()) ** 3).mean() / in_deg.std() ** 3),
-            frac_no_in_links=float((in_deg == 0).mean()), top1pct_share_of_in_links=top.sum() / in_deg.sum(),
-            reachable_frac=reach / n,
-            bytes_per_vec_vectors=d * 4, bytes_per_vec_level0_links=2 * M * 4,
-            bytes_per_vec_upper_links=(n_links_total - n * 2 * M) * 4 / n,
-            index_file_bytes=path.stat().st_size))
-        # Locality: mean |id gap| along level-0 links under each cached ordering (lower = more local).
-        coo = A.tocoo()
-        layouts = [("identity", None)] + [
-            (p.name[len(path.stem) + 1:-len(".perm.npz")].replace("-", ":", 1), p)
-            for p in sorted(path.parent.glob(f"{path.stem}.*.perm.npz"))]
-        for order, p in layouts:
-            pos = np.arange(n) if p is None else inverse(np.load(p)["perm"])
-            gap = np.abs(pos[coo.row] - pos[coo.col])
-            gap_rows.append(dict(corpus=name, M=M, efc=efc, order=order, mean_link_id_gap=gap.mean(),
-                                 median_link_id_gap=float(np.median(gap)),
-                                 frac_links_within_64=float((gap <= 64).mean())))
-        print(f"[diag] {name}: reachable {reach / n:.4f}, in-degree max {in_deg.max():.0f}, {len(layouts)} layouts")
-    write_rows(Path(a.out) / "rows.csv", graph_rows)
-    write_rows(Path(a.out) / "rows-gaps.csv", gap_rows)
 
 
 # ----------------------------------------------------------------------------- quality (step 9)
@@ -339,15 +213,14 @@ def cmd_pipeline(a):
         pipe.retriever = r
         pipe.answer_audio(data_dir / items[0]["audio_file"], k=a.k)
 
-    rows, compare, answers = [], [], []
+    rows = []
     for i, item in enumerate(items):
         # Alternate which retriever goes first, so per-query warm-up (e.g. the encoder's first
         # call on new input) doesn't land on the same one every time.
         order = list(retrievers.items())
-        got = {}
         for rname, r in (order if i % 2 == 0 else order[::-1]):
             pipe.retriever = r
-            res = got[rname] = pipe.answer_audio(data_dir / item["audio_file"], k=a.k)
+            res = pipe.answer_audio(data_dir / item["audio_file"], k=a.k)
             t = res["timing"]
             ranked, rel = res["retrieval"]["record_ids"], qrels.get(item["query_id"], {})
             rows.append(dict(query_id=item["query_id"], retriever=rname, **t,
@@ -357,265 +230,9 @@ def cmd_pipeline(a):
                              **{f"recall@{a.k}": recall_at_k(ranked, list(rel), a.k) if rel else "",
                                 f"mrr@{a.k}": mrr_at_k(ranked, list(rel), a.k) if rel else "",
                                 f"ndcg@{a.k}": ndcg_at_k(ranked, rel, a.k) if rel else ""}))
-            answers.append(dict(query_id=item["query_id"], retriever=rname, transcript=res["transcript"],
-                                record_ids=ranked, answer=res["answer"]))
             print(f"[pipeline] {item['query_id']} {rname}: " + " ".join(f"{k_}={v:.1f}" for k_, v in t.items()))
-        # What the user would see change: the context passed to the LLM, and the answer.
-        # The two runs transcribe the audio separately, so check the transcripts match too.
-        e, h = got["exact_dense"], got["hnsw"]
-        e_ids, h_ids = e["retrieval"]["record_ids"], h["retrieval"]["record_ids"]
-        compare.append(dict(query_id=item["query_id"], same_transcript=e["transcript"] == h["transcript"],
-                            topk_overlap=len(set(e_ids) & set(h_ids)) / a.k, same_context=e_ids == h_ids,
-                            same_answer=e["answer"].strip() == h["answer"].strip()))
     asr.close()
-    out = Path(a.out)
-    write_rows(out / "rows.csv", rows)
-    write_rows(out / "rows-compare.csv", compare)
-    (out / "answers.jsonl").write_text("".join(json.dumps(r) + "\n" for r in answers))
-    print(f"[pipeline] same context {np.mean([c['same_context'] for c in compare]):.3f}, "
-          f"top-{a.k} overlap {np.mean([c['topk_overlap'] for c in compare]):.3f}, "
-          f"same answer {np.mean([c['same_answer'] for c in compare]):.3f} "
-          f"(the LLM runs at temperature 0.1, so answers can differ even for the same context)")
-
-
-# ----------------------------------------------------------------------------- report (steps 6, 7)
-
-def md_table(rows, cols):
-    if not rows:
-        return "_no data_\n"
-    def fmt(v):
-        if isinstance(v, str) and re.fullmatch(r"-?\d+\.\d{5,}(e-?\d+)?|nan", v):
-            v = float(v)  # long decimals read back from CSV
-        return f"{v:.4g}" if isinstance(v, float) else str(v)
-    out = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    out += ["| " + " | ".join(fmt(r.get(c, "")) for c in cols) + " |" for r in rows]
-    return "\n".join(out) + "\n"
-
-
-def size_bytes(text):
-    """lscpu '12 MiB (1 instance)' -> bytes per instance."""
-    m = re.match(r"([\d.]+)\s*([KMG])i?B?(?:\s*\((\d+) instance)?", text or "")
-    if not m:
-        return float("nan")
-    return float(m.group(1)) * {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30}[m.group(2)] / int(m.group(3) or 1)
-
-
-def working_set(r):
-    """Raw vectors + level-0 links (the brief's definition); exact search: vectors only."""
-    n, d = fnum(r["n"]), fnum(r["d"])
-    links = 2 * fnum(r["M"]) * 4 if r["index"] == "hnsw" else 0
-    return n * (d * 4 + links)
-
-
-def load_results(results):
-    rows = []
-    for p in sorted(Path(results).glob("*/*/rows*.csv")):
-        with open(p, newline="") as f:
-            for r in csv.DictReader(f):
-                r["step"], r["run"], r["file"] = p.parts[-3], p.parts[-2], p.name
-                rows.append(r)
-    return rows
-
-
-def cmd_report(a):
-    rows = load_results(a.results)
-    out = Path(a.results) / "report"
-    out.mkdir(parents=True, exist_ok=True)
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        plt = None
-    md = [f"# ANN experiment report\n\nGenerated from {len({r['run'] for r in rows})} runs under `{a.results}`.\n"]
-    step = lambda name: [r for r in rows if r["step"] == name]
-
-    # --- Step 2: tuning
-    tune = step("2-tune")
-    md.append("## Step 2: settings (FiQA-extra queries)\n")
-    md.append("```\n" + json.dumps(load_settings(Path(a.results) / "settings.json"), indent=2) + "\n```\n")
-    gw = [dict(corpus=c, order=o, LL_miss_per_q=med(g, "LL_miss_per_q"), reorder_s=med(g, "reorder_s"))
-          for (c, o), g in group([r for r in tune if r["mode"] == "cachegrind"], "corpus", "order").items()]
-    md.append("Gorder window sweep (Cachegrind, net LL misses per query):\n\n" + md_table(gw, ["corpus", "order", "LL_miss_per_q", "reorder_s"]))
-
-    # --- Step 3 + 6: stage 1 and the matched-recall headline
-    s1 = [r for r in step("3-stage1") if r["mode"] == "time"]
-    md.append("## Step 3: Stage 1 (course queries)\n")
-    curve = [dict(host=h, corpus=c, index=i, M=M, efc=e, ef=ef, recall=med(g, "recall_at_k"),
-                  recall_at_1=med(g, "recall_at_1"), recall_at_5=med(g, "recall_at_5"), p50_us=med(g, "p50_us"),
-                  p95_us=med(g, "p95_us"), p99_us=med(g, "p99_us"), batch_qps=med(g, "batch_qps"),
-                  ndis_per_q=med(g, "ndis_per_q"), search_peak_rss_mb=med(g, "search_peak_rss_mb"))
-             for (h, c, i, M, e, ef), g in group(s1, "host", "corpus", "index", "M", "efc", "ef").items()]
-    md.append("recall = recall@10 against exact search; recall_at_1/5 from the same results. search_peak_rss_mb is the "
-              "search process's peak memory (index + Python + libraries).\n\n")
-    md.append(md_table(curve, ["host", "corpus", "index", "M", "efc", "ef", "recall", "recall_at_1", "recall_at_5", "p50_us",
-                               "p95_us", "p99_us", "batch_qps", "ndis_per_q", "search_peak_rss_mb"]))
-    write_rows(out / "stage1_curve.csv", curve) if curve else None
-
-    headline = []
-    for (h, c), g in group(curve, "host", "corpus").items():
-        ex = {r["index"]: r for r in g if r["index"] != "hnsw"}
-        hn = sorted((r for r in g if r["index"] == "hnsw"), key=lambda r: int(r["ef"]))
-        src = {r["index"]: r for r in s1 if r["host"] == h and r["corpus"] == c}
-        for t in (0.90, 0.95, 0.99):
-            hit = next((r for r in hn if r["recall"] >= t), None)
-            row = dict(host=h, corpus=c, target=t, hnsw_ef=hit["ef"] if hit else "not reached",
-                       hnsw_p50_us=hit["p50_us"] if hit else "", hnsw_batch_qps=hit["batch_qps"] if hit else "")
-            for kind in ("exact_dense", "faiss_exact"):
-                if kind in ex:
-                    row[f"{kind}_p50_us"] = ex[kind]["p50_us"]
-                    row[f"{kind}_batch_qps"] = ex[kind]["batch_qps"]
-                    if hit:
-                        row[f"speedup_vs_{kind}"] = ex[kind]["p50_us"] / hit["p50_us"]
-            if "hnsw" in src:
-                r0 = src["hnsw"]
-                row.update(hnsw_bytes_per_vec=fnum(r0["index_bytes"]) / fnum(r0["n"]), build_s=fnum(r0["build_s"]),
-                           build_total_s=fnum(r0.get("build_total_s", "")), build_threads=r0.get("build_threads", ""),
-                           build_peak_rss_mb=fnum(r0["build_peak_rss_mb"]))
-            if "exact_dense" in src:
-                row["exact_bytes_per_vec"] = fnum(src["exact_dense"]["index_bytes"]) / fnum(src["exact_dense"]["n"])
-            headline.append(row)
-    md.append("## Step 6: matched-recall headline (recall@10 vs exact)\n")
-    md.append("p50 = single-query latency. ExactDenseRetriever has no batched call, so only FAISS exact has a batched figure. "
-              "build_s = HNSW graph construction only (index.add); build_total_s adds reading the vectors and saving the index. "
-              "Exact search has no build.\n\n")
-    md.append(md_table(headline, ["host", "corpus", "target", "hnsw_ef", "hnsw_p50_us", "exact_dense_p50_us", "faiss_exact_p50_us",
-                                  "speedup_vs_exact_dense", "speedup_vs_faiss_exact", "hnsw_batch_qps", "faiss_exact_batch_qps",
-                                  "hnsw_bytes_per_vec", "exact_bytes_per_vec", "build_s", "build_total_s", "build_threads",
-                                  "build_peak_rss_mb"]))
-
-    # --- Step 4 + 7: reordering wall clock, random-seed spread, break-even
-    s4 = [r for r in step("4-reorder") if r["mode"] == "time"]
-    reo = []
-    for (h, c, ef), g in group(s4, "host", "corpus", "ef").items():
-        by = {o: med(gg, "p50_us") for (o,), gg in group(g, "order").items()}
-        spread = {o: (min(fnum(r["p50_us"]) for r in gg), max(fnum(r["p50_us"]) for r in gg)) for (o,), gg in group(g, "order").items()}
-        rnd = [v for o, v in by.items() if o.startswith("random:")]
-        base_id = by.get("identity")
-        rmean = float(np.mean(rnd)) if rnd else float("nan")
-        for o, v in sorted(by.items()):
-            rs = next(fnum(r["reorder_s"]) for r in g if r["order"] == o)
-            save_us = (base_id - v) if base_id else float("nan")
-            reo.append(dict(host=h, corpus=c, ef=ef, order=o, p50_us=v, rounds_min=spread[o][0], rounds_max=spread[o][1],
-                            gain_vs_identity=1 - v / base_id if base_id else "", gain_vs_random_mean=1 - v / rmean if rnd else "",
-                            reorder_s=rs, breakeven_queries=rs / (save_us * 1e-6) if save_us and save_us > 0 and rs else ""))
-        if rnd:
-            reo.append(dict(host=h, corpus=c, ef=ef, order=f"random (mean of {len(rnd)} seeds)", p50_us=rmean,
-                            rounds_min=min(rnd), rounds_max=max(rnd),
-                            gain_vs_identity=1 - rmean / base_id if base_id else ""))
-    md.append("## Steps 4 + 7: reordering (wall clock, course queries)\n\nFor random seeds, min/max are over seeds; otherwise over rounds. "
-              "Break-even = reorder time / per-query saving vs identity.\n\n")
-    md.append(md_table(reo, ["host", "corpus", "ef", "order", "p50_us", "rounds_min", "rounds_max", "gain_vs_identity",
-                             "gain_vs_random_mean", "reorder_s", "breakeven_queries"]))
-
-    # --- Step 5: cache-size sweep
-    s5 = [r for r in step("5-cachesweep") if r["mode"] == "cachegrind"]
-    sweep = []
-    for (c, i, ef, LL), g in group(s5, "corpus", "index", "ef", "LL_bytes").items():
-        ident = next((fnum(r["LL_miss_per_q"]) for r in g if r["order"] == "identity"), float("nan"))
-        for r in g:
-            v = fnum(r["LL_miss_per_q"])
-            sweep.append(dict(corpus=c, index=i, ef=ef, order=r["order"], LL_MiB=fnum(LL) / 2**20,
-                              ws_over_LL=working_set(r) / fnum(LL), D1_miss_per_q=fnum(r["D1_miss_per_q"]),
-                              LL_miss_per_q=v, LL_miss_per_ndis=fnum(r["LL_miss_per_ndis"]),
-                              LL_reduction_vs_identity=1 - v / ident if ident else float("nan")))
-    sweep.sort(key=lambda r: (r["corpus"], r["index"], str(r["ef"]), r["order"], r["LL_MiB"]))
-    if sweep:
-        write_rows(out / "cachesweep.csv", sweep)
-    # Real machines' points: wall-clock gain at working set / real L3.
-    real = [dict(host=r["host"], corpus=r["corpus"], ef=r["ef"], order=r["order"], gain=r["gain_vs_identity"],
-                 ws_over_L3=working_set(next(x for x in s4 if x["host"] == r["host"] and x["corpus"] == r["corpus"]))
-                 / size_bytes(next(x for x in s4 if x["host"] == r["host"])["l3"]))
-            for r in reo if r["order"] in ("bfs",) or r["order"].startswith("gorder:")]
-    md.append("## Step 5: cache-size sweep (Cachegrind, course queries)\n\nFull table: `cachesweep.csv`. "
-              "Real-machine wall-clock gains at their working set / L3:\n\n")
-    md.append(md_table(real, ["host", "corpus", "ef", "order", "ws_over_L3", "gain"]))
-    if plt and sweep:
-        for ef in sorted({r["ef"] for r in sweep if r["index"] == "hnsw"}):
-            fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-            for (c, o), g in group([r for r in sweep if r["index"] == "hnsw" and r["ef"] == ef], "corpus", "order").items():
-                g = sorted(g, key=lambda r: r["ws_over_LL"])
-                x = [r["ws_over_LL"] for r in g]
-                ls = "-" if c == sorted({r["corpus"] for r in sweep})[0] else "--"
-                axes[0].plot(x, [r["LL_miss_per_q"] for r in g], ls, marker="o", label=f"{c} {o}")
-                if o != "identity":
-                    axes[1].plot(x, [r["LL_reduction_vs_identity"] for r in g], ls, marker="o", label=f"{c} {o}")
-            for r in real:
-                if str(r["ef"]) == str(ef) and r["gain"] != "":
-                    axes[1].scatter([r["ws_over_L3"]], [r["gain"]], marker="*", s=150, zorder=5)
-                    axes[1].annotate(f"{r['host']} {r['corpus']} {r['order']} (wall clock)", (r["ws_over_L3"], r["gain"]), fontsize=7)
-            for ax, yl in zip(axes, ["LL misses per query", "reduction vs original order"]):
-                ax.set_xscale("log"); ax.set_xlabel("working set / simulated LL"); ax.set_ylabel(yl)
-            axes[0].legend(fontsize=7)
-            fig.suptitle(f"Cache-size sweep, efSearch={ef}")
-            fig.tight_layout()
-            fig.savefig(out / f"cachesweep_ef{ef}.png", dpi=120)
-            plt.close(fig)
-            md.append(f"![cache sweep ef={ef}](cachesweep_ef{ef}.png)\n")
-    if plt and curve:
-        for (h,), g in group(curve, "host").items():
-            fig, ax = plt.subplots(figsize=(6, 4.5))
-            for (c, i), gg in group(g, "corpus", "index").items():
-                gg = sorted(gg, key=lambda r: r["recall"])
-                ax.plot([r["recall"] for r in gg], [r["p50_us"] for r in gg], marker="o", label=f"{c} {i}")
-            ax.set_yscale("log"); ax.set_xlabel("recall@10 vs exact"); ax.set_ylabel("p50 latency (us)")
-            ax.legend(fontsize=7); ax.set_title(f"Recall vs latency, {h}")
-            fig.tight_layout(); fig.savefig(out / f"recall_latency_{h}.png", dpi=120); plt.close(fig)
-            md.append(f"![recall vs latency {h}](recall_latency_{h}.png)\n")
-    if not plt:
-        md.append("_matplotlib not installed: plots skipped; plot from the CSVs in this folder._\n")
-
-    # --- Step 9, 10, 11, diag
-    q = step("9-quality")
-    md.append("## Step 9: qrels quality (course dev queries)\n\n" + md_table(q, [c for c in (q[0] if q else {}) if c not in ("step", "run", "file")]))
-    s10 = [r for r in step("10-queryset") if r["mode"] == "time"]
-    other = [r for r in s1 + s4]
-    qs = []
-    for (h, c, i, o, ef), g in group(s10, "host", "corpus", "index", "order", "ef").items():
-        ref = [r for r in other if (r["host"], r["corpus"], r["index"], r["order"], r["ef"]) == (h, c, i, o, ef)]
-        qs.append(dict(host=h, corpus=c, index=i, order=o, ef=ef, fiqa_recall=med(g, "recall_at_k"), fiqa_p50_us=med(g, "p50_us"),
-                       course_recall=med(ref, "recall_at_k") if ref else "", course_p50_us=med(ref, "p50_us") if ref else ""))
-    md.append("## Step 10: query-set robustness (FiQA-extra vs course)\n\n" + md_table(qs, ["host", "corpus", "index", "order", "ef", "course_recall", "fiqa_recall", "course_p50_us", "fiqa_p50_us"]))
-    pl = [r for r in step("11-pipeline") if r["file"] == "rows.csv"]
-    qcols = [c for c in (pl[0] if pl else {}) if c.split("@")[0] in ("recall", "mrr", "ndcg")]
-    pt = [dict(retriever=rn, n=len(g),
-               **{c: med(g, c) for c in ("asr_ms", "embedding_ms", "retrieval_ms", "retrieval_call_ms", "generation_ms",
-                                         "end_to_end_ms", "retrieval_share")},
-               **{c: float(np.mean([fnum(r[c]) for r in g if r[c] != ""] or [float("nan")])) for c in qcols})
-          for (rn,), g in group(pl, "retriever").items()]
-    md.append("## Step 11: the full pipeline, exact_dense vs HNSW (dev queries)\n\n"
-              "Times are medians; qrels metrics are means over dev queries with qrels. retrieval_call_ms is the whole "
-              "retrieve() call; retrieval_share = retrieval_call_ms / end_to_end_ms.\n\n"
-              + md_table(pt, ["retriever", "n", "asr_ms", "embedding_ms", "retrieval_ms", "retrieval_call_ms", "generation_ms",
-                              "end_to_end_ms", "retrieval_share"] + qcols))
-    cmp_ = [r for r in step("11-pipeline") if r["file"] == "rows-compare.csv"]
-    if cmp_:
-        frac = lambda c: float(np.mean([r[c] == "True" for r in cmp_]))
-        md.append("\nWhat changes for the user (per dev query, HNSW vs exact_dense):\n\n" + md_table(
-            [dict(n=len(cmp_), same_transcript=frac("same_transcript"), median_topk_overlap=med(cmp_, "topk_overlap"),
-                  same_context=frac("same_context"), same_answer=frac("same_answer"))],
-            ["n", "same_transcript", "median_topk_overlap", "same_context", "same_answer"]))
-        md.append("\nThe LLM runs at temperature 0.1, so answers can differ "
-                  "even with the same context: compare same_answer with same_context. Answers are in answers.jsonl.\n")
-
-    # --- perf (laptop): real hardware counters, warm cache
-    pr = [r for r in rows if r.get("mode") == "perf"]
-    if pr:
-        pcols = ["cycles_per_q", "instructions_per_q", "ipc", "LLC_loads_per_q", "LLC_load_misses_per_q",
-                 "L1_dcache_load_misses_per_q", "dTLB_load_misses_per_q", "ndis_per_q"]
-        ptab = [dict(host=h, corpus=c, index=i, ef=ef, order=o, rounds=len(g),
-                     **{col: med(g, col) for col in pcols if col in g[0]})
-                for (h, c, i, ef, o), g in group(pr, "host", "corpus", "index", "ef", "order").items()]
-        md.append("## Hardware counters (perf stat, warm cache, per query, median over rounds)\n\n"
-                  + md_table(ptab, ["host", "corpus", "index", "ef", "order", "rounds"] + pcols))
-        write_rows(out / "perf.csv", ptab)
-    dg = [r for r in step("diag") if r["file"] == "rows.csv"]
-    gp = [r for r in step("diag") if r["file"] == "rows-gaps.csv"]
-    md.append("## Graph diagnostics\n\n" + md_table(dg, [c for c in (dg[0] if dg else {}) if c not in ("step", "run", "file")]))
-    md.append("\nLocality per ordering (mean id gap along level-0 links):\n\n" + md_table(gp, ["corpus", "order", "mean_link_id_gap", "median_link_id_gap", "frac_links_within_64"]))
-
-    (out / "summary.md").write_text("\n".join(md))
-    print(f"wrote {out / 'summary.md'}")
+    write_rows(Path(a.out) / "rows.csv", rows)
 
 
 # ----------------------------------------------------------------------------- main
@@ -628,18 +245,6 @@ def main():
     p.add_argument("--cache", required=True)
     p.add_argument("--corpus", nargs="+", required=True, help="name=path/to/corpus_enc_a.npy")
     p.add_argument("--course-queries", required=True)
-    p.add_argument("--fiqa-queries", required=True)
-    p.add_argument("--out", required=True)
-
-    p = sub.add_parser("pick")
-    p.add_argument("--rows", nargs="+", required=True)
-    p.add_argument("--settings", required=True)
-    p.add_argument("--select-recall", type=float, default=0.95)
-
-    p = sub.add_parser("diag")
-    p.add_argument("--cache", required=True)
-    p.add_argument("--names", nargs="+", required=True)
-    p.add_argument("--settings", required=True)
     p.add_argument("--out", required=True)
 
     p = sub.add_parser("quality")
@@ -661,9 +266,6 @@ def main():
     p.add_argument("--k", type=int, default=5)
     p.add_argument("--device", default=None)
     p.add_argument("--out", required=True)
-
-    p = sub.add_parser("report")
-    p.add_argument("--results", required=True)
 
     a = ap.parse_args()
     globals()[f"cmd_{a.cmd}"](a)

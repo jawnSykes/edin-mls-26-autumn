@@ -1,0 +1,4 @@
+item,nq,identical,rows_identical,top10_sets_identical,step,run,file,run_ts,run_host
+gt-course-k100.npy,475.0,False,0.9810526315789474,1.0,1-setup,jetsykes-hp-ubuntu-20261117T204501,rows-vs-cached,20261117T204501,jetsykes-hp-ubuntu
+queries/course.npy,,True,,,1-setup,jetsykes-hp-ubuntu-20261117T204501,rows-vs-cached,20261117T204501,jetsykes-hp-ubuntu
+queries/course_ids.json,,True,,,1-setup,jetsykes-hp-ubuntu-20261117T204501,rows-vs-cached,20261117T204501,jetsykes-hp-ubuntu

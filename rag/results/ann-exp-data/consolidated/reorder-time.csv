@@ -1,0 +1,16 @@
+timestamp,host,corpus,M,efc,order,round,cpu,reorder_s,perm_sha1,cached_perm_sha1,same_as_cached,on_ac,loadavg_1m,step,run,file,run_ts,run_host
+2026-11-17T20:45:24,jetsykes-hp-ubuntu,24k,16,200,bfs,0,2,0.04346451407764107,1145407b3b51,1145407b3b51,True,1,0.76,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:45:24,jetsykes-hp-ubuntu,24k,16,200,random:0,0,2,0.0009050710359588265,aadd821f95f3,aadd821f95f3,True,1,0.76,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:46:46,jetsykes-hp-ubuntu,24k,16,200,gorder:10,0,2,80.76087226497475,59427016ae9e,59427016ae9e,True,1,1.39,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:46:46,jetsykes-hp-ubuntu,24k,16,200,random:0,1,2,0.0008949029725044966,aadd821f95f3,aadd821f95f3,True,1,1.39,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:48:08,jetsykes-hp-ubuntu,24k,16,200,gorder:10,1,2,81.20126531401183,59427016ae9e,59427016ae9e,True,1,1.88,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:48:08,jetsykes-hp-ubuntu,24k,16,200,bfs,1,2,0.04443073202855885,1145407b3b51,1145407b3b51,True,1,1.89,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:48:09,jetsykes-hp-ubuntu,24k,16,200,bfs,2,2,0.04482265701517463,1145407b3b51,1145407b3b51,True,1,1.89,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:49:30,jetsykes-hp-ubuntu,24k,16,200,gorder:10,2,2,81.11602102499455,59427016ae9e,59427016ae9e,True,1,1.38,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:49:31,jetsykes-hp-ubuntu,24k,16,200,random:0,2,2,0.0009136280277743936,aadd821f95f3,aadd821f95f3,True,1,1.38,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:49:31,jetsykes-hp-ubuntu,24k,16,200,bfs,3,2,0.04458931693807244,1145407b3b51,1145407b3b51,True,1,1.38,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:49:31,jetsykes-hp-ubuntu,24k,16,200,random:0,3,2,0.0009016520343720913,aadd821f95f3,aadd821f95f3,True,1,1.38,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:50:53,jetsykes-hp-ubuntu,24k,16,200,gorder:10,3,2,81.22092035098467,59427016ae9e,59427016ae9e,True,1,1.23,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:50:54,jetsykes-hp-ubuntu,24k,16,200,bfs,4,2,0.04475665104109794,1145407b3b51,1145407b3b51,True,1,1.23,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:50:54,jetsykes-hp-ubuntu,24k,16,200,random:0,4,2,0.0008908059680834413,aadd821f95f3,aadd821f95f3,True,1,1.23,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu
+2026-11-17T20:52:16,jetsykes-hp-ubuntu,24k,16,200,gorder:10,4,2,81.48053638904821,59427016ae9e,59427016ae9e,True,1,1.24,reorder-time,jetsykes-hp-ubuntu-20261117T204523,rows,20261117T204523,jetsykes-hp-ubuntu

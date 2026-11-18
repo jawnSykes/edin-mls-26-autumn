@@ -1,20 +1,19 @@
 """Search benchmark: one CSV row per cell, each cell measured in its own child process.
 
-A cell is one (index kind, M, efConstruction, order, efSearch, SIMD level, simulated LL size).
+A cell is one (index kind, M, efConstruction, order, efSearch, SIMD level).
 Every combination of the list-valued flags is a cell. Index kinds: exact_dense (the course's
 ExactDenseRetriever, called as the pipeline calls it), faiss_exact (FAISS IndexFlatIP) and hnsw.
 
   --mode time        pinned, single-threaded wall clock: p50/p95/p99 per query, batched QPS,
                      FAISS work counters. Cells are interleaved over shuffled --rounds.
-  --mode cachegrind  the child runs under valgrind --tool=cachegrind with a simulated D1/LL.
-                     Each cell also runs a 'nosearch' twin (load + reorder, no search) that is
-                     subtracted, so only the search's misses count. Deterministic: one round.
+  --mode perf        the child runs under `perf stat`, with the counters switched on only around
+                     its timed passes: cycles, instructions, LLC, L1d and dTLB misses per query.
 
 Before measuring, every reordered graph is checked against the original order (same top-k,
 same distance computations). A mismatch aborts the run: the permutation is wrong.
 
 Indexes, permutations and ground truth live in $PERSIST_INDEX_PATH/<--name>/ (ground truth
-comes from `exp.py prep`). Normally run via run_experiments.sbatch, e.g.:
+comes from `exp.py prep`). Run via laptop_rerun.py or run_experiments.sbatch, e.g.:
     bench.py --name 24k --embeddings .../corpus_enc_a.npy --queries $PERSIST_INDEX_PATH/queries/course.npy \\
         --index hnsw --M 16 --efc 40 --ef 32 128 --order identity random:0 random:1 bfs gorder:5 \\
         --out rows.csv --log-dir $DISK_SCRATCH/logs
@@ -167,8 +166,7 @@ INDEXES = {"exact_dense": prepare_exact_dense, "faiss_exact": prepare_faiss_exac
 # ----------------------------------------------------------------------------- child process
 
 def child(cfg):
-    """Modes: 'check' (reorder correctness), 'time', 'cg' (under valgrind) and 'perf' (under
-    perf stat); cg and perf run twice, cfg['search'] on/off, and the parent subtracts."""
+    """Modes: 'check' (reorder correctness), 'time' and 'perf' (under perf stat)."""
     if cfg["cpu"] is not None:
         os.sched_setaffinity(0, {cfg["cpu"]})
     import faiss
@@ -227,12 +225,7 @@ def child(cfg):
             for i in range(len(Q)):
                 search_one(Q[i:i + 1])
 
-        if cfg["mode"] == "cg":
-            if cfg["search"]:
-                stats.reset()
-                plain_pass()
-                out["ndis"], out["nhops"] = int(stats.ndis), int(stats.nhops)
-        elif cfg["mode"] == "perf":
+        if cfg["mode"] == "perf":
             # Under `perf stat -D -1 --control`: counters start disabled and are switched on only
             # around the timed passes, so start-up, loading and the warm-up pass never count.
             plain_pass()  # warm-up
@@ -284,9 +277,6 @@ def child(cfg):
 
 # ----------------------------------------------------------------------------- parent
 
-CG_RE = re.compile(r"==\d+==\s+(D\s+refs|D1\s+misses|LLd\s+misses):\s+([\d,]+)")
-
-
 PERF_EVENTS = "cycles:u,instructions:u,LLC-loads:u,LLC-load-misses:u,L1-dcache-load-misses:u,dTLB-load-misses:u"
 
 
@@ -304,12 +294,12 @@ def parse_perf(path):
     return counts
 
 
-def run_child(cfg, log, simd=None, valgrind=None, perf_out=None):
-    """Run one child, log its output, return (RESULT dict, valgrind or perf counters).
-    `valgrind` is a command prefix (valgrind or perf stat); `perf_out` the perf stat output file."""
+def run_child(cfg, log, simd=None, prefix=None, perf_out=None):
+    """Run one child, log its output, return (RESULT dict, perf counters or {}).
+    `prefix` is a command prefix (perf stat); `perf_out` the perf stat output file."""
     cmd = [sys.executable, str(Path(__file__).resolve()), "_child", json.dumps(cfg)]
-    if valgrind:
-        cmd = valgrind + cmd
+    if prefix:
+        cmd = prefix + cmd
     env = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
     if simd:
         env["FAISS_SIMD_LEVEL"] = simd
@@ -319,14 +309,11 @@ def run_child(cfg, log, simd=None, valgrind=None, perf_out=None):
     lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
     if proc.returncode != 0 or not lines:
         raise RuntimeError(f"child failed (rc={proc.returncode}), see {log}\n{proc.stderr[-2000:]}")
-    counters = {re.sub(r"\s+", "_", m.group(1)): int(m.group(2).replace(",", ""))
-                for m in CG_RE.finditer(proc.stderr)}
+    counters = {}
     if perf_out:
         counters = parse_perf(perf_out)
         if "cycles" not in counters:
             raise RuntimeError(f"no perf counts in {perf_out}")
-    elif valgrind and "LLd_misses" not in counters:
-        raise RuntimeError(f"no cachegrind summary in {log}")
     return json.loads(lines[-1][len("RESULT "):]), counters
 
 
@@ -389,24 +376,21 @@ def main():
     ap.add_argument("--order", nargs="+", default=["identity"], help="identity, random:<seed>, bfs, gorder:<w>")
     ap.add_argument("--simd", nargs="+", default=[None], help="FAISS_SIMD_LEVEL per cell (default: inherit env)")
     ap.add_argument("--k", type=int, default=10)
-    ap.add_argument("--mode", choices=["time", "cachegrind", "perf"], default="time")
+    ap.add_argument("--mode", choices=["time", "perf"], default="time")
     ap.add_argument("--reps", type=int, default=5, help="timed passes over all queries per cell per round")
     ap.add_argument("--rounds", type=int, default=3, help="interleaved rounds (time mode)")
     ap.add_argument("--seed", type=int, default=0, help="shuffles the interleaving only")
     ap.add_argument("--cpu", type=int, default=None, help="core to pin to (default: BENCH_CPU, else first P-core)")
-    ap.add_argument("--LL", nargs="+", type=int, default=[8 << 20], help="cachegrind: simulated LL bytes (16-way, 64B)")
-    ap.add_argument("--D1", default=os.environ.get("D1", ""), help="cachegrind: size,ways,line (default: $D1)")
-    ap.add_argument("--valgrind", default=os.environ.get("VALGRIND", "valgrind"))
     ap.add_argument("--perf", default=os.environ.get("PERF", "perf"), help="perf mode: the perf binary")
     ap.add_argument("--perf-events", default=PERF_EVENTS, help="perf mode: events for perf stat -e")
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--log-dir", type=Path, required=True, help="per-cell logs and cachegrind files (scratch)")
+    ap.add_argument("--log-dir", type=Path, required=True, help="per-cell logs and perf files (scratch)")
     args = ap.parse_args()
 
     args.embeddings, args.queries = args.embeddings.expanduser(), args.queries.expanduser()
     args.ids = (args.ids or args.embeddings.with_name(args.embeddings.stem + "_ids.json")).expanduser()
-    for key in ("index", "M", "efc", "ef", "order", "simd", "LL"):  # e.g. ef95 == ef99 -> one cell
+    for key in ("index", "M", "efc", "ef", "order", "simd"):  # e.g. ef95 == ef99 -> one cell
         setattr(args, key, list(dict.fromkeys(getattr(args, key))))
     for spec in args.order:
         parse_order(spec)
@@ -414,20 +398,15 @@ def main():
         raise SystemExit("set PERSIST_INDEX_PATH (indexes, permutations and ground truth are cached there)")
     cache = Path(os.environ["PERSIST_INDEX_PATH"]).expanduser() / args.name
     cache.mkdir(parents=True, exist_ok=True)
-    cg = args.mode == "cachegrind"
     pf = args.mode == "perf"
-    if cg and not args.D1:
-        raise SystemExit("cachegrind mode needs --D1 size,ways,line (or $D1)")
-    if cg and any((lv or os.environ.get("FAISS_SIMD_LEVEL")) not in (None, "", "AVX2", "NONE") for lv in args.simd):
-        raise SystemExit("cachegrind mode: valgrind cannot run AVX-512, use --simd AVX2")
-    args.log_dir.mkdir(parents=True, exist_ok=True)  # cachegrind writes its out-files here
+    args.log_dir.mkdir(parents=True, exist_ok=True)
     gt = cache / f"gt-{args.queries.stem}-k{GT_K}.npy"
     if not gt.exists():
         raise SystemExit(f"missing ground truth {gt}; run `exp.py prep` first")
     nq_total = len(np.load(args.queries, mmap_mode="r"))
     nq = min(args.nq or nq_total, nq_total)
     cpu = pick_cpu(args.cpu)
-    rounds = 1 if cg else args.rounds
+    rounds = args.rounds
 
     # ---- prepare: graphs, permutations, correctness check
     graphs = []  # (kind, M, efc, info, {order: (perm path, secs, hash)})
@@ -455,12 +434,12 @@ def main():
     cells = []
     for kind, M, efc, info, perms in graphs:
         efs = args.ef if kind == "hnsw" else [None]
-        for order, ef, simd, LL in itertools.product(perms, efs, args.simd, args.LL if cg else [None]):
-            cells.append((kind, M, efc, info, order, perms[order], ef, simd, LL))
+        for order, ef, simd in itertools.product(perms, efs, args.simd):
+            cells.append((kind, M, efc, info, order, perms[order], ef, simd))
 
     base = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **machine_info(), "pinned_cpu": cpu, **freq_state(cpu),
             "mode": args.mode, "tag": args.tag, "corpus": args.name, "queries": args.queries.stem,
-            "nq": nq, "k": args.k, "reps": 0 if cg else args.reps}
+            "nq": nq, "k": args.k, "reps": args.reps}
     if pf:
         base["perf_events"] = args.perf_events
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -468,9 +447,9 @@ def main():
     summary, total, done = {}, len(cells) * rounds, 0
     for rnd in range(rounds):
         for ci in rng.permutation(len(cells)):
-            kind, M, efc, info, order, (p, reorder_s, phash), ef, simd, LL = cells[ci]
+            kind, M, efc, info, order, (p, reorder_s, phash), ef, simd = cells[ci]
             done += 1
-            cid = f"{kind}-M{M}-efc{efc}-{order.replace(':', '-')}-ef{ef}-{simd}-LL{LL}-r{rnd}"
+            cid = f"{kind}-M{M}-efc{efc}-{order.replace(':', '-')}-ef{ef}-{simd}-r{rnd}"
             cfg = dict(kind=kind, path=str(info["path"]), ids=str(args.ids), perm=str(p) if p else None,
                        queries=str(args.queries), gt=str(gt), nq=nq, k=args.k, ef=ef, reps=args.reps, cpu=cpu)
             row = {**base, "round": rnd, "index": kind, "M": M, "efc": efc, "order": order, "ef": ef,
@@ -479,22 +458,7 @@ def main():
                    "build_total_s": info.get("build_total_s", ""), "build_threads": info.get("build_threads", ""),
                    "build_peak_rss_mb": info.get("build_peak_rss_mb", ""), "index_bytes": info["index_bytes"],
                    "n": info["n"], "d": info["d"]}
-            if cg:
-                row.update(D1=args.D1, LL_bytes=LL)
-                vg = lambda twin: [args.valgrind, "--tool=cachegrind", "--cache-sim=yes", f"--D1={args.D1}",
-                                   f"--LL={LL},16,64", f"--cachegrind-out-file={args.log_dir / (cid + f'-{twin}.cg.out')}"]
-                res, c_s = run_child({**cfg, "mode": "cg", "search": True}, args.log_dir / f"{cid}-search.log", simd, vg("search"))
-                _, c_b = run_child({**cfg, "mode": "cg", "search": False}, args.log_dir / f"{cid}-nosearch.log", simd, vg("nosearch"))
-                net = {key: c_s[key] - c_b.get(key, 0) for key in c_s}
-                row.update(simd_level=res["simd_level"], faiss_version=res["faiss_version"],
-                           ndis_per_q=res.get("ndis", 0) / nq, nhops_per_q=res.get("nhops", 0) / nq,
-                           **{f"{key}_raw": c_s[key] for key in c_s}, **{f"{key}_base": c_b.get(key, 0) for key in c_s},
-                           D_refs_per_q=net.get("D_refs", 0) / nq, D1_miss_per_q=net["D1_misses"] / nq,
-                           LL_miss_per_q=net["LLd_misses"] / nq,
-                           LL_miss_per_ndis=net["LLd_misses"] / res["ndis"] if res.get("ndis") else "")
-                msg = f"D1/q={row['D1_miss_per_q']:.0f} LL/q={row['LL_miss_per_q']:.0f} LL={LL >> 20}MiB"
-                key_cols = ["LL_miss_per_q"]
-            elif pf:
+            if pf:
                 # Real hardware counters, warm cache, per query. The child switches the counters on
                 # only around its timed passes (perf's control FIFOs), so nothing else counts.
                 fifo_dir = args.log_dir / f"{cid}-fifo"
@@ -524,10 +488,10 @@ def main():
                        f"ndis/q={res['ndis_per_q']:.0f} simd={res['simd_level']}")
                 key_cols = ["p50_us", "p95_us"]
             append_row(args.out, row)
-            summary.setdefault((kind, M, efc, order, ef, simd, LL), []).append(row)
+            summary.setdefault((kind, M, efc, order, ef, simd), []).append(row)
             print(f"[{done}/{total}] r{rnd} {args.name} {kind} M={M} efc={efc} {order:<10} ef={ef} {msg}", flush=True)
     print(f"appended {total} rows -> {args.out}")
-    if not cg and freq_state(cpu) != {k: base[k] for k in ("governor", "no_turbo", "max_freq_khz")}:
+    if freq_state(cpu) != {k: base[k] for k in ("governor", "no_turbo", "max_freq_khz")}:
         print("!! clock settings changed during the run; rows record the state at the start")
 
     # Median over rounds with the min-max spread, to see whether a difference beats the noise.

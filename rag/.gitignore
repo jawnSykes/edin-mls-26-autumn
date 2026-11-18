@@ -8,8 +8,11 @@ __pycache__/
 venv/
 results/*
 !results/ann-exp-data/
+# run provenance (env.txt per run); the repo-root env/ rule is for virtualenvs
+!results/ann-exp-data/consolidated/env/
 *.log
 .pytest_cache/
+.ipynb_checkpoints/
 *.aux
 *.bbl
 *.blg

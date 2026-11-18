@@ -1,7 +1,0 @@
-corpus,buffer,thp_setting,array_kb,rss_kb,huge_kb,frac_on_2m_pages
-24k,exact_dense (numpy),always [madvise] never,36000,36004,34816,0.9671111111111111
-24k,faiss_exact (IndexFlatIP),always [madvise] never,36000,158408,0,0.0
-24k,hnsw storage,always [madvise] never,36000,158408,0,0.0
-58k,exact_dense (numpy),always [madvise] never,86397,259200,83968,0.971885597879556
-58k,faiss_exact (IndexFlatIP),always [madvise] never,86397,172804,0,0.0
-58k,hnsw storage,always [madvise] never,86397,172804,0,0.0

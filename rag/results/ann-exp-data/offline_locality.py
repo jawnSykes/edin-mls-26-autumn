@@ -2,8 +2,7 @@
 
 Run from rag/ with mls-rag-env (needs faiss + scipy):
     ~/mls-rag-env/bin/python results/ann-exp-data/offline_locality.py
-Writes results/ann-exp-data/offline/locality.csv and offline/page_backing.csv (how much of each
-retriever's vector array the kernel backs with 2 MiB transparent huge pages on *this* machine).
+Writes results/ann-exp-data/consolidated/locality.csv.
 
 Byte layout: vector at position p starts at BASE + p*1536 (FAISS IndexFlat codes buffer).
 BASE mod 4096 = 16 was measured (glibc mmap header) and is unchanged by permute_entries;
@@ -21,7 +20,7 @@ sys.path.insert(0, str(RAG))
 from extensions.reorder import inverse, level0_csr  # noqa: E402
 
 CACHE = Path.home() / "mls-rag-assets" / "ann-cache"
-OUT = Path(__file__).resolve().parent / "offline" / "locality.csv"
+OUT = Path(__file__).resolve().parent / "consolidated" / "locality.csv"
 VEC_BYTES, LINE, PAGE, HUGE, BASE = 1536, 64, 4096, 2 << 20, 16
 
 
@@ -63,51 +62,9 @@ def sibling_adjacent_per_neighbour(indptr, sib_pos):
     return float((pairs[ok] / deg[ok]).mean())
 
 
-def backing_kb(addr, nbytes):
-    """Rss and AnonHugePages (kB) summed over every mapping that overlaps [addr, addr + nbytes)."""
-    import re
-    tot, cur = {"Rss": 0, "AnonHugePages": 0}, False
-    for line in open("/proc/self/smaps"):
-        m = re.match(r"^([0-9a-f]+)-([0-9a-f]+) ", line)
-        if m:
-            lo, hi = int(m[1], 16), int(m[2], 16)
-            cur = lo < addr + nbytes and addr < hi
-        elif cur and line.split(":")[0] in tot:
-            tot[line.split(":")[0]] += int(line.split()[1])
-    return tot
-
-
-def page_backing():
-    """numpy (as ExactDenseRetriever loads it) vs FAISS IndexFlatIP vs FAISS HNSW storage."""
-    thp = Path("/sys/kernel/mm/transparent_hugepage/enabled").read_text().strip()
-    npy = {"24k": RAG / "data/rag_corpus/embeddings/corpus_enc_a.npy",
-           "58k": RAG / "data/fiqa_full/embeddings/corpus_enc_a.npy"}
-    rows, keep = [], []
-    for corpus in ["24k", "58k"]:
-        X = np.asarray(np.load(npy[corpus]), dtype=np.float32)  # exactly ExactDenseRetriever.__init__
-        keep.append(X)
-        bufs = [("exact_dense (numpy)", X.ctypes.data, X.nbytes)]
-        for label, f in [("faiss_exact (IndexFlatIP)", "flat.faiss"), ("hnsw storage", "hnsw-corpus_enc_a-16-200.faiss")]:
-            raw = faiss.read_index(str(CACHE / corpus / f))
-            keep.append(raw)  # keep the owner alive while smaps is read
-            flat = faiss.downcast_index(raw.storage if hasattr(raw, "storage") else raw)
-            bufs.append((label, int(flat.codes.data()), flat.ntotal * flat.d * 4))
-        for label, addr, nbytes in bufs:
-            t = backing_kb(addr, nbytes)
-            rows.append(dict(corpus=corpus, buffer=label, thp_setting=thp, array_kb=nbytes >> 10,
-                             rss_kb=t["Rss"], huge_kb=t["AnonHugePages"],
-                             frac_on_2m_pages=t["AnonHugePages"] / max(1, nbytes >> 10)))
-    with open(OUT.parent / "page_backing.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
-    for r in rows:
-        print(f"[pages] {r['corpus']} {r['buffer']}: {100 * r['frac_on_2m_pages']:.0f}% on 2 MiB pages ({thp})")
-
-
 def main():
     rows = []
-    for corpus in ["24k", "58k"]:
+    for corpus in ["24k"]:
         path = CACHE / corpus / "hnsw-corpus_enc_a-16-200.faiss"
         index = faiss.read_index(str(path))
         A = level0_csr(index)
@@ -142,7 +99,6 @@ def main():
         w.writeheader()
         w.writerows(rows)
     print(f"wrote {OUT}")
-    page_backing()
 
 
 if __name__ == "__main__":
