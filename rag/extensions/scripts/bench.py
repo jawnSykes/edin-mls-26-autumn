@@ -150,11 +150,29 @@ def prepare_hnsw(args, cache, M, efc):
                    build_threads=faiss.omp_get_max_threads(),
                    build_peak_rss_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
     print(f"[prepare] {path.name}: {'loaded' if r.loaded else 'built'}", flush=True)
+    graph_summary(r.index, path)
     m = _meta(path)
     return dict(path=path, build_s=m.get("build_s", float("nan")), build_total_s=m.get("build_total_s", float("nan")),
                 build_threads=m.get("build_threads", ""),
                 build_peak_rss_mb=m.get("build_peak_rss_mb", float("nan")), index_bytes=path.stat().st_size,
                 n=r.index.ntotal, d=r.index.d)
+
+
+def graph_summary(index, path):
+    """Print the shape of the HNSW graph: nodes per layer, level-0 degree, link overhead."""
+    import faiss
+    from extensions.reorder import level0_csr
+    h, n, d = index.hnsw, index.ntotal, index.d
+    levels = faiss.vector_to_array(h.levels).astype(np.int64)  # per node: number of layers it is on
+    per_layer = [int((levels > l).sum()) for l in range(int(levels.max()))]
+    deg0 = level0_csr(index).nnz / n
+    raw = n * d * 4
+    extra = path.stat().st_size - raw
+    print(f"[prepare] graph: {n:,} nodes on {len(per_layer)} layers "
+          f"({' / '.join(f'{c:,}' for c in reversed(per_layer))}, top to bottom), entry node {int(h.entry_point)}", flush=True)
+    print(f"[prepare] graph: level-0 degree {deg0:.1f} avg (max {int(h.nb_neighbors(0))}); "
+          f"links add {extra / n:.0f} B/vector ({100 * extra / raw:.1f}% over the {raw / 2**20:.1f} MiB of vectors)",
+          flush=True)
 
 
 # exact_dense: the current method, the course's ExactDenseRetriever itself (numpy matmul + top-k)
@@ -217,7 +235,7 @@ def child(cfg):
         # may break the tie by id, which the reordering changes).
         same = (to_original_ids(I, perm) == I_ref) | (D == D_ref)
         out = dict(topk_match=float(same.all(axis=1).mean()),
-                   ndis_rel_diff=abs(ndis - ndis_ref) / max(ndis_ref, 1))
+                   ndis_rel_diff=abs(ndis - ndis_ref) / max(ndis_ref, 1), ndis_ref=ndis_ref, ndis=ndis)
     else:
         perm = apply_order(index, np.load(cfg["perm"])["perm"]) if cfg["perm"] else None
 
@@ -426,6 +444,10 @@ def main():
                 cfg = dict(mode="check", kind=kind, path=str(info["path"]), perm=str(p), queries=str(args.queries),
                            nq=nq, k=args.k, ef=ef, cpu=cpu)
                 res, _ = run_child(cfg, args.log_dir / f"check-{kind}-M{M}-efc{efc}-{order.replace(':', '-')}-ef{ef}.log")
+                same_q = round(res["topk_match"] * nq)
+                print(f"[check] {order:<10} ef={ef:<4} same top-{args.k} as original order: {same_q}/{nq} queries; "
+                      f"distances computed {res['ndis'] / nq:,.1f}/q vs {res['ndis_ref'] / nq:,.1f}/q "
+                      f"({100 * (res['ndis'] - res['ndis_ref']) / max(res['ndis_ref'], 1):+.2f}%)", flush=True)
                 if res["topk_match"] != 1.0 or res["ndis_rel_diff"] >= 1e-3:
                     raise SystemExit(f"reordering changed results: {kind} M={M} efc={efc} {order} ef={ef}: {res}")
     print(f"[prepare] reorder correctness check passed", flush=True)
@@ -478,9 +500,11 @@ def main():
                            **{f"{key}_per_q": v / nqs for key, v in net.items()},
                            ipc=net["instructions"] / net["cycles"] if net.get("cycles") else "",
                            LLC_miss_per_ndis=net.get("LLC_load_misses", 0) / res["ndis"] if res.get("ndis") else "")
+                llc_d = row["LLC_miss_per_ndis"]
                 msg = (f"cycles/q={row['cycles_per_q']:.0f} ipc={row['ipc']:.2f} "
-                       f"LLC-miss/q={row.get('LLC_load_misses_per_q', float('nan')):.0f}")
-                key_cols = ["cycles_per_q", "LLC_load_misses_per_q"]
+                       f"LLC-miss/distance={llc_d:.2f}" if llc_d != "" else
+                       f"cycles/q={row['cycles_per_q']:.0f} ipc={row['ipc']:.2f}")
+                key_cols = ["instructions_per_q", "cycles_per_q", "LLC_load_misses_per_q", "dTLB_load_misses_per_q"]
             else:
                 res, _ = run_child({**cfg, "mode": "time"}, args.log_dir / f"{cid}.log", simd)
                 row.update(res)
@@ -494,14 +518,39 @@ def main():
     if freq_state(cpu) != {k: base[k] for k in ("governor", "no_turbo", "max_freq_khz")}:
         print("!! clock settings changed during the run; rows record the state at the start")
 
-    # Median over rounds with the min-max spread, to see whether a difference beats the noise.
-    print(f"\nmedian [min-max] over {rounds} round(s)")
-    for key, rs in summary.items():
+    # Median over rounds with the min-max spread, to see whether a difference beats the noise,
+    # and for reordered HNSW cells the change against the original (identity) order at the same ef.
+    short = {"p50_us": "p50", "p95_us": "p95", "instructions_per_q": "instr/q", "cycles_per_q": "cycles/q",
+             "LLC_load_misses_per_q": "LLC-miss/q", "dTLB_load_misses_per_q": "dTLB-miss/q"}
+
+    def med(rs, c):
+        v = np.array([float(r.get(c) or "nan") for r in rs])
+        return np.median(v), v.min(), v.max()
+
+    spread = rounds > 1
+    print(f"\nmedian{' [min-max]' if spread else ''} over {rounds} round(s); (%) = change vs original order")
+    rank = {"identity": 0, "random": 1, "bfs": 2, "gorder": 3}
+
+    def sort_key(kv):  # exact first, then by graph config, ef, and identity -> random -> bfs -> gorder
+        kind, M, efc, order, ef, simd = kv[0]
+        return (kind != "exact_dense", kind, M or 0, efc or 0, ef or 0, rank.get(order.split(":")[0], 9), order, str(simd))
+
+    for key, rs in sorted(summary.items(), key=sort_key):
+        kind, M, efc, order, ef, simd = key
+        base_rs = summary.get((kind, M, efc, "identity", ef, simd)) if kind == "hnsw" and order != "identity" else None
         txt = []
         for c in key_cols:
-            v = np.array([float(r[c]) for r in rs])
-            txt.append(f"{c}={np.median(v):.1f} [{v.min():.1f}-{v.max():.1f}]")
-        print(f"  {' '.join(str(x) for x in key if x is not None):<40} " + "  ".join(txt))
+            m, lo, hi = med(rs, c)
+            t = f"{short.get(c, c)}={m:,.1f}" + (f" [{lo:,.1f}-{hi:,.1f}]" if spread else "")
+            if base_rs:
+                b = med(base_rs, c)[0]
+                t += f" ({100 * (m - b) / b:+.1f}%)"
+            txt.append(t)
+        many = len(args.M) > 1 or len(args.efc) > 1  # sweeps: keep the graph config in the label
+        label = " ".join(str(x) for x in (kind, f"M={M} efc={efc}" if many and kind == "hnsw" else None,
+                                          order if kind == "hnsw" else None, f"ef={ef}" if ef else None,
+                                          f"simd={simd}" if len(args.simd) > 1 else None) if x)
+        print(f"  {label:<24} " + "  ".join(txt))
 
 
 if __name__ == "__main__":
